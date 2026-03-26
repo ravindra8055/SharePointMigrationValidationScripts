@@ -25,6 +25,7 @@ $TargetUserName = "hardcoded.user@tenant.onmicrosoft.com"
 $TargetPasswordPlain = "HardcodedPasswordHere"
 $TargetClientId = "00000000-0000-0000-0000-000000000000"
 $script:PnPModuleMode = ""
+$script:TargetPnPConnected = $false
 
 function Import-CSOMAssemblies {
 	[CmdletBinding()]
@@ -57,19 +58,20 @@ function Import-PnPModule {
 	param()
 
 	if ($PSVersionTable.PSVersion.Major -le 5) {
-		if (Get-Module -ListAvailable -Name SharePointPnPPowerShellOnline) {
+		$legacyModule = Get-Module -ListAvailable -Name SharePointPnPPowerShellOnline | Select-Object -First 1
+		$modernModule = Get-Module -ListAvailable -Name PnP.PowerShell | Select-Object -First 1
+
+		if ($null -ne $legacyModule) {
 			Import-Module SharePointPnPPowerShellOnline -ErrorAction Stop
 			$script:PnPModuleMode = "Legacy"
 			return
 		}
 
-		if (Get-Module -ListAvailable -Name PnP.PowerShell) {
-			Import-Module PnP.PowerShell -ErrorAction Stop
-			$script:PnPModuleMode = "Modern"
-			return
+		if ($null -ne $modernModule) {
+			throw "PnP.PowerShell is installed on this machine, but it is not compatible with Windows PowerShell 5.1. Install SharePointPnPPowerShellOnline for PowerShell 5.1, or run this script in PowerShell 7 if you want to use PnP.PowerShell."
 		}
 
-		throw "No supported PnP module found. For Windows PowerShell 5.1 install SharePointPnPPowerShellOnline."
+		throw "No compatible PnP module found for Windows PowerShell 5.1. Install SharePointPnPPowerShellOnline using Install-Module SharePointPnPPowerShellOnline -Scope CurrentUser."
 	}
 
 	Import-Module PnP.PowerShell -ErrorAction Stop
@@ -106,12 +108,17 @@ function Connect-TargetPnP {
 		Connect-PnPOnline -Url $Url -Credentials $credential
 	}
 
+	$script:TargetPnPConnected = $true
 	return (Get-PnPConnection).Context
 }
 
 function Disconnect-TargetPnP {
 	[CmdletBinding()]
 	param()
+
+	if (-not $script:TargetPnPConnected) {
+		return
+	}
 
 	if (Get-Command Disconnect-PnPOnline -ErrorAction SilentlyContinue) {
 		Disconnect-PnPOnline -ErrorAction SilentlyContinue
