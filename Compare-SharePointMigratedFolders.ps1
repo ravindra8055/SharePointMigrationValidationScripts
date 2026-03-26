@@ -24,6 +24,7 @@ $ErrorActionPreference = "Stop"
 $TargetUserName = "hardcoded.user@tenant.onmicrosoft.com"
 $TargetPasswordPlain = "HardcodedPasswordHere"
 $TargetClientId = "00000000-0000-0000-0000-000000000000"
+$script:PnPModuleMode = ""
 
 function Import-CSOMAssemblies {
 	[CmdletBinding()]
@@ -51,15 +52,28 @@ function Import-CSOMAssemblies {
 	throw "Unable to load CSOM assemblies. Install SharePoint CSOM or run this on a SharePoint server with ISAPI DLLs."
 }
 
-function Ensure-PnPModule {
+function Import-PnPModule {
 	[CmdletBinding()]
 	param()
 
-	if (-not (Get-Module -ListAvailable -Name PnP.PowerShell)) {
-		throw "PnP.PowerShell module not found. Install with: Install-Module PnP.PowerShell -Scope CurrentUser"
+	if ($PSVersionTable.PSVersion.Major -le 5) {
+		if (Get-Module -ListAvailable -Name SharePointPnPPowerShellOnline) {
+			Import-Module SharePointPnPPowerShellOnline -ErrorAction Stop
+			$script:PnPModuleMode = "Legacy"
+			return
+		}
+
+		if (Get-Module -ListAvailable -Name PnP.PowerShell) {
+			Import-Module PnP.PowerShell -ErrorAction Stop
+			$script:PnPModuleMode = "Modern"
+			return
+		}
+
+		throw "No supported PnP module found. For Windows PowerShell 5.1 install SharePointPnPPowerShellOnline."
 	}
 
 	Import-Module PnP.PowerShell -ErrorAction Stop
+	$script:PnPModuleMode = "Modern"
 }
 
 function Get-SourceContext {
@@ -83,9 +97,25 @@ function Connect-TargetPnP {
 
 	$securePassword = ConvertTo-SecureString $TargetPasswordPlain -AsPlainText -Force
 	$credential = New-Object System.Management.Automation.PSCredential($TargetUserName, $securePassword)
+	$connectCommand = Get-Command Connect-PnPOnline -ErrorAction Stop
 
-	Connect-PnPOnline -Url $Url -Credentials $credential -ClientId $TargetClientId
+	if ($connectCommand.Parameters.ContainsKey("ClientId") -and -not [string]::IsNullOrWhiteSpace($TargetClientId)) {
+		Connect-PnPOnline -Url $Url -Credentials $credential -ClientId $TargetClientId
+	}
+	else {
+		Connect-PnPOnline -Url $Url -Credentials $credential
+	}
+
 	return (Get-PnPConnection).Context
+}
+
+function Disconnect-TargetPnP {
+	[CmdletBinding()]
+	param()
+
+	if (Get-Command Disconnect-PnPOnline -ErrorAction SilentlyContinue) {
+		Disconnect-PnPOnline -ErrorAction SilentlyContinue
+	}
 }
 
 function Convert-ToServerRelativeUrl {
@@ -263,7 +293,7 @@ function Start-NewLogFile {
 	$State.CurrentFilePath = Join-Path $State.OutputFolder $name
 }
 
-function Flush-LogBuffer {
+function Write-LogBuffer {
 	[CmdletBinding()]
 	param(
 		[Parameter(Mandatory = $true)]
@@ -299,7 +329,7 @@ function Add-MissingRecord {
 	}
 
 	if ($State.CurrentFileRecordCount -ge $State.MaxRecords) {
-		Flush-LogBuffer -State $State
+		Write-LogBuffer -State $State
 		Start-NewLogFile -State $State
 	}
 
@@ -307,7 +337,7 @@ function Add-MissingRecord {
 	$State.CurrentFileRecordCount++
 
 	if ($State.Buffer.Count -ge $State.BufferFlushSize) {
-		Flush-LogBuffer -State $State
+		Write-LogBuffer -State $State
 	}
 }
 
@@ -380,7 +410,7 @@ try {
 	$logState = New-LogWriterState -Folder $OutputFolder -MaxRecords $MaxOutputRecordsPerFile
 
 	Import-CSOMAssemblies
-	Ensure-PnPModule
+	Import-PnPModule
 
 	if (-not (Test-Path $CsvPath)) {
 		throw "CSV file not found: $CsvPath"
@@ -483,7 +513,7 @@ catch {
 finally {
 	if ($null -ne $logState) {
 		try {
-			Flush-LogBuffer -State $logState
+			Write-LogBuffer -State $logState
 		}
 		catch {
 			Write-Warning "Failed to flush log buffer. $($_.Exception.Message)"
@@ -503,7 +533,7 @@ finally {
 	Write-Host "Output folder                    : $OutputFolder"
 
 	try {
-		Disconnect-PnPOnline -ErrorAction SilentlyContinue
+		Disconnect-TargetPnP
 	}
 	catch {
 		Write-Warning "Disconnect-PnPOnline failed. $($_.Exception.Message)"
