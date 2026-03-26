@@ -92,7 +92,9 @@ function Convert-ToServerRelativeUrl {
 	[CmdletBinding()]
 	param(
 		[Parameter(Mandatory = $true)]
-		[string]$Url
+		[string]$Url,
+
+		[string]$SiteUrl
 	)
 
 	if ([string]::IsNullOrWhiteSpace($Url)) {
@@ -103,8 +105,19 @@ function Convert-ToServerRelativeUrl {
 		return $Url.TrimEnd("/")
 	}
 
-	$uri = [Uri]$Url
-	return $uri.AbsolutePath.TrimEnd("/")
+	$uriKind = [System.UriKind]::Absolute
+	if ([Uri]::IsWellFormedUriString($Url, $uriKind)) {
+		$uri = [Uri]$Url
+		return $uri.AbsolutePath.TrimEnd("/")
+	}
+
+	if ([string]::IsNullOrWhiteSpace($SiteUrl)) {
+		throw "Relative folder URL '$Url' requires SiteUrl to resolve to server-relative path."
+	}
+
+	$sitePath = ([Uri]$SiteUrl).AbsolutePath.TrimEnd("/")
+	$combined = ($sitePath + "/" + $Url.TrimStart("/")).TrimEnd("/")
+	return $combined
 }
 
 function Get-ListAndFolderContext {
@@ -335,7 +348,7 @@ function Get-FolderUrlMapping {
 	}
 
 	if ([string]::IsNullOrWhiteSpace($targetUrl)) {
-		$sourceRel = Convert-ToServerRelativeUrl -Url $sourceUrl
+		$sourceRel = Convert-ToServerRelativeUrl -Url $sourceUrl -SiteUrl $SourceSite
 		$sourceSiteRel = ([Uri]$SourceSite).AbsolutePath.TrimEnd("/")
 
 		if (-not $sourceRel.StartsWith($sourceSiteRel, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -392,8 +405,8 @@ try {
 		$mapping = $null
 		try {
 			$mapping = Get-FolderUrlMapping -Row $row -SourceSite $SourceSiteUrl -TargetSite $TargetSiteUrl
-			$sourceFolderRel = Convert-ToServerRelativeUrl -Url $mapping.SourceFolderUrl
-			$targetFolderRel = Convert-ToServerRelativeUrl -Url $mapping.TargetFolderUrl
+				$sourceFolderRel = Convert-ToServerRelativeUrl -Url $mapping.SourceFolderUrl -SiteUrl $SourceSiteUrl
+				$targetFolderRel = Convert-ToServerRelativeUrl -Url $mapping.TargetFolderUrl -SiteUrl $TargetSiteUrl
 
 			$sourceFolderContext = Get-ListAndFolderContext -Context $sourceContext -FolderServerRelativeUrl $sourceFolderRel
 			$targetFolderContext = Get-ListAndFolderContext -Context $targetContext -FolderServerRelativeUrl $targetFolderRel
