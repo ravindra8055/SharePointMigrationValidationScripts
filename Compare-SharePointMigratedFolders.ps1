@@ -12,6 +12,12 @@ param(
 	[Parameter(Mandatory = $true)]
 	[string]$OutputFolder,
 
+	[ValidateSet("SPOnline", "SP2016", "SP2019")]
+	[string]$SourcePlatform,
+
+	[ValidateSet("SPOnline", "SP2016", "SP2019")]
+	[string]$TargetPlatform,
+
 	[int]$MaxOutputRecordsPerFile = 10000,
 
 	[int]$PageSize = 2000
@@ -90,7 +96,7 @@ function Get-SourceContext {
 	return $ctx
 }
 
-function Connect-TargetPnP {
+function Connect-OnlinePnP {
 	[CmdletBinding()]
 	param(
 		[Parameter(Mandatory = $true)]
@@ -110,6 +116,55 @@ function Connect-TargetPnP {
 
 	$script:TargetPnPConnected = $true
 	return (Get-PnPConnection).Context
+}
+
+function Resolve-Platform {
+	[CmdletBinding()]
+	param(
+		[string]$Platform,
+		[Parameter(Mandatory = $true)]
+		[string]$Url
+	)
+
+	if (-not [string]::IsNullOrWhiteSpace($Platform)) {
+		return $Platform
+	}
+
+	$host = ([Uri]$Url).Host.ToLowerInvariant()
+	if ($host -like "*.sharepoint.com") {
+		return "SPOnline"
+	}
+
+	# Default on-prem autodetect to SP2019 for auth behavior; SP2016/SP2019 use same auth path in this script.
+	return "SP2019"
+}
+
+function Test-IsOnlinePlatform {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory = $true)]
+		[string]$Platform
+	)
+
+	return ($Platform -eq "SPOnline")
+}
+
+function Assert-PlatformCombination {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory = $true)]
+		[string]$ResolvedSourcePlatform,
+
+		[Parameter(Mandatory = $true)]
+		[string]$ResolvedTargetPlatform
+	)
+
+	$sourceOnline = Test-IsOnlinePlatform -Platform $ResolvedSourcePlatform
+	$targetOnline = Test-IsOnlinePlatform -Platform $ResolvedTargetPlatform
+
+	if (($sourceOnline -and $targetOnline) -or ((-not $sourceOnline) -and (-not $targetOnline))) {
+		throw "Invalid platform combination. Exactly one side must be SPOnline, and the other side must be SP2016/SP2019."
+	}
 }
 
 function Disconnect-TargetPnP {
@@ -186,7 +241,7 @@ function Get-ListAndFolderContext {
 	}
 }
 
-function Get-RecursiveFolderInventory {
+function Get-FolderItemsInventory {
 	[CmdletBinding()]
 	param(
 		[Parameter(Mandatory = $true)]
@@ -210,7 +265,7 @@ function Get-RecursiveFolderInventory {
 		$query.FolderServerRelativeUrl = $RootFolderServerRelativeUrl
 		$query.ListItemCollectionPosition = $position
 		$query.ViewXml = @"
-<View Scope='RecursiveAll'>
+<View>
 	<ViewFields>
 		<FieldRef Name='FileRef' />
 		<FieldRef Name='FileLeafRef' />
@@ -238,17 +293,16 @@ function Get-RecursiveFolderInventory {
 				continue
 			}
 
-			$relativePath = $fileRef.Substring($RootFolderServerRelativeUrl.Length).TrimStart("/")
-			if ([string]::IsNullOrWhiteSpace($relativePath)) {
+			$name = [string]$item["FileLeafRef"]
+			if ([string]::IsNullOrWhiteSpace($name)) {
 				continue
 			}
 
 			$itemType = if ($isFolder) { "Folder" } else { "File" }
-			$key = "{0}|{1}" -f $relativePath.ToLowerInvariant(), $itemType
+			$key = "{0}|{1}" -f $name.ToLowerInvariant(), $itemType
 
 			$inventory[$key] = [PSCustomObject]@{
-				RelativePath = $relativePath
-				Name = [string]$item["FileLeafRef"]
+				Name = $name
 				ItemType = $itemType
 				Url = $fileRef
 				LastModified = [datetime]$item["Modified"]
@@ -415,16 +469,33 @@ $summary = [PSCustomObject]@{
 
 try {
 	$logState = New-LogWriterState -Folder $OutputFolder -MaxRecords $MaxOutputRecordsPerFile
+	$resolvedSourcePlatform = Resolve-Platform -Platform $SourcePlatform -Url $SourceSiteUrl
+	$resolvedTargetPlatform = Resolve-Platform -Platform $TargetPlatform -Url $TargetSiteUrl
+	Assert-PlatformCombination -ResolvedSourcePlatform $resolvedSourcePlatform -ResolvedTargetPlatform $resolvedTargetPlatform
 
 	Import-CSOMAssemblies
-	Import-PnPModule
+
+	if ((Test-IsOnlinePlatform -Platform $resolvedSourcePlatform) -or (Test-IsOnlinePlatform -Platform $resolvedTargetPlatform)) {
+		Import-PnPModule
+	}
 
 	if (-not (Test-Path $CsvPath)) {
 		throw "CSV file not found: $CsvPath"
 	}
 
-	$sourceContext = Get-SourceContext -Url $SourceSiteUrl
-	$targetContext = Connect-TargetPnP -Url $TargetSiteUrl
+	if (Test-IsOnlinePlatform -Platform $resolvedSourcePlatform) {
+		$sourceContext = Connect-OnlinePnP -Url $SourceSiteUrl
+	}
+	else {
+		$sourceContext = Get-SourceContext -Url $SourceSiteUrl
+	}
+
+	if (Test-IsOnlinePlatform -Platform $resolvedTargetPlatform) {
+		$targetContext = Connect-OnlinePnP -Url $TargetSiteUrl
+	}
+	else {
+		$targetContext = Get-SourceContext -Url $TargetSiteUrl
+	}
 
 	$rows = Import-Csv -Path $CsvPath
 	if ($null -eq $rows -or $rows.Count -eq 0) {
@@ -432,6 +503,8 @@ try {
 	}
 
 	$summary.TotalFolderRows = $rows.Count
+	Write-Host "Source platform                 : $resolvedSourcePlatform"
+	Write-Host "Target platform                 : $resolvedTargetPlatform"
 
 	$rowIndex = 0
 	foreach ($row in $rows) {
@@ -448,8 +521,8 @@ try {
 			$sourceFolderContext = Get-ListAndFolderContext -Context $sourceContext -FolderServerRelativeUrl $sourceFolderRel
 			$targetFolderContext = Get-ListAndFolderContext -Context $targetContext -FolderServerRelativeUrl $targetFolderRel
 
-			$sourceItems = Get-RecursiveFolderInventory -Context $sourceContext -List $sourceFolderContext.List -RootFolderServerRelativeUrl $sourceFolderContext.FolderServerRelativeUrl -RowLimit $PageSize
-			$targetItems = Get-RecursiveFolderInventory -Context $targetContext -List $targetFolderContext.List -RootFolderServerRelativeUrl $targetFolderContext.FolderServerRelativeUrl -RowLimit $PageSize
+			$sourceItems = Get-FolderItemsInventory -Context $sourceContext -List $sourceFolderContext.List -RootFolderServerRelativeUrl $sourceFolderContext.FolderServerRelativeUrl -RowLimit $PageSize
+			$targetItems = Get-FolderItemsInventory -Context $targetContext -List $targetFolderContext.List -RootFolderServerRelativeUrl $targetFolderContext.FolderServerRelativeUrl -RowLimit $PageSize
 
 			foreach ($sourceKey in $sourceItems.Keys) {
 				if ($targetItems.ContainsKey($sourceKey)) {
