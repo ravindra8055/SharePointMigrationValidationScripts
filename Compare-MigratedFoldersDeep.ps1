@@ -636,14 +636,14 @@ function Get-TargetFolderItemsPaged {
         $files = $null
         $subFolders = $null
         try {
-            $files = Get-PnPFolderItem -List $LibraryUrlName -FolderSiteRelativeUrl $currentSiteRelativePath -ItemType File -ErrorAction Stop
-            $subFolders = Get-PnPFolderItem -List $LibraryUrlName -FolderSiteRelativeUrl $currentSiteRelativePath -ItemType Folder -ErrorAction Stop
+            $files = Get-PnPFolderItem -FolderSiteRelativeUrl $currentSiteRelativePath -ItemType File -ErrorAction Stop
+            $subFolders = Get-PnPFolderItem -FolderSiteRelativeUrl $currentSiteRelativePath -ItemType Folder -ErrorAction Stop
         }
         catch {
             $encodedSiteRelativePath = [System.Uri]::EscapeUriString($currentSiteRelativePath)
             try {
-                $files = Get-PnPFolderItem -List $LibraryUrlName -FolderSiteRelativeUrl $encodedSiteRelativePath -ItemType File -ErrorAction Stop
-                $subFolders = Get-PnPFolderItem -List $LibraryUrlName -FolderSiteRelativeUrl $encodedSiteRelativePath -ItemType Folder -ErrorAction Stop
+                $files = Get-PnPFolderItem -FolderSiteRelativeUrl $encodedSiteRelativePath -ItemType File -ErrorAction Stop
+                $subFolders = Get-PnPFolderItem -FolderSiteRelativeUrl $encodedSiteRelativePath -ItemType Folder -ErrorAction Stop
             }
             catch {
                 throw "Paged retrieval failed for '$FolderUrl' at folder '$currentSiteRelativePath': $_"
