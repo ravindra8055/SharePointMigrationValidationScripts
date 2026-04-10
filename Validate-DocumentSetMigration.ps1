@@ -696,7 +696,7 @@ function Start-NewFileDiffOutputFile {
     param()
 
     $timestamp  = Get-Date -Format "yyyyMMdd-HHmmss"
-    $script:CurrentFileDiffOutputFile = Join-Path $OutputFolder "FileDiff_Part$($script:FileDiffFileCounter)_$timestamp_Row$($script:FileDiffCurrentRowNumber)_$($script:FileDiffCurrentSafeNewLocation).csv"
+    $script:CurrentFileDiffOutputFile = Join-Path $OutputFolder "FileDiff_Part$($script:FileDiffFileCounter)_$($timestamp)_Row$($script:FileDiffCurrentRowNumber)_$($script:FileDiffCurrentSafeNewLocation).csv"
     $script:CurrentFileDiffRowCount = 0
     $script:FileDiffFileCounter++
     $script:FileDiffFilesCreated++
