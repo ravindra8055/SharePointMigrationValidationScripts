@@ -10,18 +10,18 @@
 
     For every input folder pair the script produces three outputs:
 
-      1. FolderSummary CSV      — one row per input pair: total recursive item counts
+      1. FolderSummary CSV      - one row per input pair: total recursive item counts
                                   (files and folders separately) for source and target,
                                   plus counts of missing and extra items.
 
-      2. MissingItems CSV(s)    — one row per discrepant item (missing in target or extra
+      2. MissingItems CSV(s)    - one row per discrepant item (missing in target or extra
                                   in target) containing: relative path within root folder,
                                   item type, last-modified date, full source URL and target
                                   URL. Files are automatically split when MaxRecordsPerFile
                                   rows are reached (default 10,000) to respect the SharePoint
                                   list view threshold and to keep output files manageable.
 
-      3. CompareDeep .log file  — every action, warning and error written immediately as
+      3. CompareDeep .log file  - every action, warning and error written immediately as
                                   it happens (no buffering).
 
     Source (SP2019) data is retrieved via CSOM using the currently-logged-in Windows
@@ -151,7 +151,7 @@ function Write-Log {
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $entry     = "[$timestamp] [$Level] $Message"
 
-    # Write immediately to log file — no buffering
+    # Write immediately to log file - no buffering
     Add-Content -Path $script:LogFile -Value $entry -Encoding UTF8
 
     switch ($Level) {
@@ -209,7 +209,7 @@ function Get-SourceContext {
         try {
             $ctx = New-Object Microsoft.SharePoint.Client.ClientContext($SiteUrl)
             $ctx.Credentials   = [System.Net.CredentialCache]::DefaultNetworkCredentials
-            $ctx.RequestTimeout = 300000   # 5 minutes — needed for large recursive queries
+            $ctx.RequestTimeout = 300000   # 5 minutes - needed for large recursive queries
             $script:SourceContexts[$siteKey] = $ctx
             Write-Log "Source CSOM context created for: $SiteUrl"
         }
@@ -471,7 +471,7 @@ function Get-SourceItemsRecursive {
             throw "Source query failed (page $pageCount) for '$serverRelativePath': $_"
         }
 
-        Write-Log "Source: page $pageCount — $($pageItems.Count) items returned"
+        Write-Log "Source: page $pageCount - $($pageItems.Count) items returned"
 
         foreach ($item in $pageItems) {
             $name        = [string]$item["FileLeafRef"]
@@ -532,7 +532,7 @@ function Get-TargetItemsRecursive {
     Write-Log "Target: fetching list '$libraryUrlName' recursively under '$serverRelativePath'"
 
     # CAML: RecursiveAll, BeginsWith on FileDirRef.
-    # PnP.PowerShell with -PageSize handles the 10,000-item threshold automatically —
+    # PnP.PowerShell with -PageSize handles the 10,000-item threshold automatically -
     # it pages through all results internally without extra loop logic needed here.
     $escapedRootPath = [System.Security.SecurityElement]::Escape($serverRelativePath)
     $camlViewXml     = "<View Scope='RecursiveAll'>" +
@@ -627,11 +627,11 @@ function Export-MissingItemsToFile {
 
         try {
             if ($script:CurrentMissingItemsFileRowCount -eq 0) {
-                # First write to this file — create with header
+                # First write to this file - create with header
                 $batch | Export-Csv -Path $script:CurrentMissingItemsFile -NoTypeInformation -Encoding UTF8 -Force
             }
             else {
-                # Append — PS 5.1 Export-Csv -Append skips the header row automatically
+                # Append - PS 5.1 Export-Csv -Append skips the header row automatically
                 $batch | Export-Csv -Path $script:CurrentMissingItemsFile -NoTypeInformation -Encoding UTF8 -Append
             }
             $script:CurrentMissingItemsFileRowCount += $batchSize
@@ -657,7 +657,7 @@ function Export-SummaryRowToFile {
         [PSCustomObject]$Row
     )
 
-    # Create the file path on the very first call — same file for the whole run
+    # Create the file path on the very first call - same file for the whole run
     if ([string]::IsNullOrEmpty($script:CurrentSummaryFile)) {
         $script:CurrentSummaryFile = Join-Path $OutputFolder "FolderSummary_$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
         Write-Log "FolderSummary file: $($script:CurrentSummaryFile)"
@@ -665,11 +665,11 @@ function Export-SummaryRowToFile {
 
     try {
         if (Test-Path $script:CurrentSummaryFile) {
-            # File already exists — append without repeating the header
+            # File already exists - append without repeating the header
             $Row | Export-Csv -Path $script:CurrentSummaryFile -NoTypeInformation -Encoding UTF8 -Append
         }
         else {
-            # First row — create file with header
+            # First row - create file with header
             $Row | Export-Csv -Path $script:CurrentSummaryFile -NoTypeInformation -Encoding UTF8 -Force
         }
     }
@@ -740,7 +740,7 @@ function Add-MissingItemRecord {
 
     # Flush buffer to file once MaxRecordsPerFile is reached
     if ($script:MissingItems.Count -ge $MaxRecordsPerFile) {
-        Write-Log "Missing-items buffer hit $MaxRecordsPerFile rows — flushing to file."
+        Write-Log "Missing-items buffer hit $MaxRecordsPerFile rows - flushing to file."
         Export-MissingItemsToFile
     }
 }
@@ -816,9 +816,8 @@ function Invoke-DeepFolderComparison {
             if ($ti.Type -eq "File") { $targetTotalFiles++ } else { $targetTotalFolders++ }
         }
 
-        Write-Log ("Row $RowNumber | Source: {0} items ({1} files, {2} folders) | Target: {3} items ({4} files, {5} folders)" -f `
-            $sourceItems.Count, $sourceTotalFiles, $sourceTotalFolders, `
-            $targetItems.Count, $targetTotalFiles, $targetTotalFolders)
+        $logMsg = "Row $RowNumber | Source: " + $sourceItems.Count + " items (" + $sourceTotalFiles + " files, " + $sourceTotalFolders + " folders) | Target: " + $targetItems.Count + " items (" + $targetTotalFiles + " files, " + $targetTotalFolders + " folders)"
+        Write-Log $logMsg
 
         # Build lookup tables keyed by lowercase relative path for O(1) lookups
         $targetLookup = @{}
@@ -950,7 +949,7 @@ function Invoke-Main {
         }
         catch {
             $pairError = "Could not resolve folder pair: $_"
-            Write-Log "Row $rowIndex | Skipping — $pairError" -Level ERROR
+            Write-Log "Row $rowIndex | Skipping - $pairError" -Level ERROR
             $script:FailedFolders++
 
             $failedSummaryRow = [PSCustomObject]@{
@@ -996,7 +995,7 @@ function Invoke-Main {
     }
 
     # ---- FolderSummary CSV ----
-    # Already fully written row-by-row during processing — just confirm its location.
+    # Already fully written row-by-row during processing - just confirm its location.
     Write-Log "FolderSummary CSV complete: $($script:CurrentSummaryFile)" -Level SUCCESS
 
     # ---- Export JSON run summary ----
@@ -1029,7 +1028,7 @@ function Invoke-Main {
     # ---- Console summary ----
     Write-Host ""
     Write-Host "==========================================" -ForegroundColor Cyan
-    Write-Host "  Deep Folder Comparison — Summary" -ForegroundColor Cyan
+    Write-Host "  Deep Folder Comparison - Summary" -ForegroundColor Cyan
     Write-Host "==========================================" -ForegroundColor Cyan
     Write-Host "Total Folder Pairs:      $($jsonSummary.TotalFolderPairs)"
     Write-Host "Processed Successfully:  $($jsonSummary.ProcessedFolders)" -ForegroundColor Green
@@ -1056,13 +1055,13 @@ function Invoke-Main {
 try {
     Invoke-Main
     Write-Host ""
-    Write-Host "✓ Deep folder comparison completed successfully." -ForegroundColor Green
+    Write-Host "[OK] Deep folder comparison completed successfully." -ForegroundColor Green
 }
 catch {
     if ($script:LogFile -ne "") {
         Write-Log "FATAL: $_" -Level ERROR
     }
-    Write-Host "✗ Script failed: $_" -ForegroundColor Red
+    Write-Host "[FAIL] Script failed: $_" -ForegroundColor Red
     exit 1
 }
 finally {
