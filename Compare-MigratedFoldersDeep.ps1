@@ -552,6 +552,11 @@ function Get-TargetItemsRecursive {
         $pnpItems = Get-PnPListItem -List $libraryUrlName -Query $camlViewXml -PageSize 500 -ErrorAction Stop
     }
     catch {
+        $errMsg = $_.Exception.Message
+        if ($errMsg -like "*list view threshold*" -or $errMsg -like "*prohibited because it exceeds*") {
+            Write-Log "Target: CAML query hit list view threshold; using paged FolderServerRelativeUrl retrieval for '$FolderUrl'"
+            return Get-TargetFolderItemsPaged -SiteRelativePath $serverRelativePath -FolderUrl $FolderUrl -LibraryUrlName $libraryUrlName
+        }
         throw "Failed to retrieve target items for folder '$FolderUrl': $_"
     }
 
@@ -591,6 +596,72 @@ function Get-TargetItemsRecursive {
     }
 
     Write-Log "Target: $($allItems.Count) items retrieved recursively from '$FolderUrl'"
+    return $allItems
+}
+
+# ==========================================
+# Function: Get All Items Recursively from Target (SPO) - Paged Fallback
+# ==========================================
+function Get-TargetFolderItemsPaged {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SiteRelativePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$FolderUrl,
+
+        [Parameter(Mandatory = $true)]
+        [string]$LibraryUrlName
+    )
+
+    Write-Log "Target: Using paged retrieval (list view threshold bypass) for: $FolderUrl"
+
+    $serverRelativePath = Get-ServerRelativePathFromUrl -Url $FolderUrl -SiteUrl $TargetSiteUrl
+
+    # Get-PnPListItem with -FolderServerRelativeUrl and -PageSize bypasses the list view threshold
+    $allItems = @()
+    try {
+        $pnpItems = Get-PnPListItem -List $LibraryUrlName -FolderServerRelativeUrl $serverRelativePath -PageSize 500 -ErrorAction Stop
+    }
+    catch {
+        throw "Paged retrieval failed for '$FolderUrl': $_"
+    }
+
+    if ($null -eq $pnpItems) {
+        Write-Log "Target (paged): no items returned for '$FolderUrl'"
+        return $allItems
+    }
+
+    foreach ($item in $pnpItems) {
+        $fsObjType = $item.FieldValues["FSObjType"]
+        $name      = $item.FieldValues["FileLeafRef"]
+        $modified  = $item.FieldValues["Modified"]
+        $fileRef   = $item.FieldValues["FileRef"]
+
+        # Skip built-in "Forms" folder
+        if ($fsObjType -eq 1 -and $name -eq "Forms") {
+            continue
+        }
+
+        # Guard against prefix ambiguity
+        if (-not $fileRef.StartsWith($serverRelativePath + "/", [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+
+        $relativePath = $fileRef.Substring($serverRelativePath.Length).TrimStart('/')
+        $itemType     = if ($fsObjType -eq 1) { "Folder" } else { "File" }
+
+        $allItems += [PSCustomObject]@{
+            Name         = $name
+            RelativePath = $relativePath
+            Url          = $fileRef
+            Type         = $itemType
+            LastModified = $modified
+        }
+    }
+
+    Write-Log "Target (paged): $($allItems.Count) items retrieved from '$FolderUrl'"
     return $allItems
 }
 
