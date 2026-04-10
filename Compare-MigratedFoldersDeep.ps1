@@ -615,53 +615,140 @@ function Get-TargetFolderItemsPaged {
         [string]$LibraryUrlName
     )
 
-    Write-Log "Target: Using paged retrieval (list view threshold bypass) for: $FolderUrl"
+    Write-Log "Target: Using folder-by-folder retrieval (threshold-safe) for: $FolderUrl"
 
-    $serverRelativePath = Get-ServerRelativePathFromUrl -Url $FolderUrl -SiteUrl $TargetSiteUrl
+    $rootServerRelativePath = Get-ServerRelativePathFromUrl -Url $FolderUrl -SiteUrl $TargetSiteUrl
+    $rootSiteRelativePath   = Get-SiteRelativePathFromUrl -Url $FolderUrl -SiteUrl $TargetSiteUrl
 
-    # Get-PnPListItem with -FolderServerRelativeUrl and -PageSize bypasses the list view threshold
     $allItems = @()
-    try {
-        $pnpItems = Get-PnPListItem -List $LibraryUrlName -FolderServerRelativeUrl $serverRelativePath -PageSize 500 -ErrorAction Stop
-    }
-    catch {
-        throw "Paged retrieval failed for '$FolderUrl': $_"
-    }
+    $queue    = New-Object System.Collections.Queue
+    $visited  = @{}
+    $queue.Enqueue($rootSiteRelativePath)
 
-    if ($null -eq $pnpItems) {
-        Write-Log "Target (paged): no items returned for '$FolderUrl'"
-        return $allItems
-    }
-
-    foreach ($item in $pnpItems) {
-        $fsObjType = $item.FieldValues["FSObjType"]
-        $name      = $item.FieldValues["FileLeafRef"]
-        $modified  = $item.FieldValues["Modified"]
-        $fileRef   = $item.FieldValues["FileRef"]
-
-        # Skip built-in "Forms" folder
-        if ($fsObjType -eq 1 -and $name -eq "Forms") {
+    while ($queue.Count -gt 0) {
+        $currentSiteRelativePath = [string]$queue.Dequeue()
+        $currentKey = $currentSiteRelativePath.ToLowerInvariant()
+        if ($visited.ContainsKey($currentKey)) {
             continue
         }
+        $visited[$currentKey] = $true
 
-        # Guard against prefix ambiguity
-        if (-not $fileRef.StartsWith($serverRelativePath + "/", [System.StringComparison]::OrdinalIgnoreCase)) {
-            continue
+        $files = $null
+        $subFolders = $null
+        try {
+            $files = Get-PnPFolderItem -List $LibraryUrlName -FolderSiteRelativeUrl $currentSiteRelativePath -ItemType File -ErrorAction Stop
+            $subFolders = Get-PnPFolderItem -List $LibraryUrlName -FolderSiteRelativeUrl $currentSiteRelativePath -ItemType Folder -ErrorAction Stop
+        }
+        catch {
+            $encodedSiteRelativePath = [System.Uri]::EscapeUriString($currentSiteRelativePath)
+            try {
+                $files = Get-PnPFolderItem -List $LibraryUrlName -FolderSiteRelativeUrl $encodedSiteRelativePath -ItemType File -ErrorAction Stop
+                $subFolders = Get-PnPFolderItem -List $LibraryUrlName -FolderSiteRelativeUrl $encodedSiteRelativePath -ItemType Folder -ErrorAction Stop
+            }
+            catch {
+                throw "Paged retrieval failed for '$FolderUrl' at folder '$currentSiteRelativePath': $_"
+            }
         }
 
-        $relativePath = $fileRef.Substring($serverRelativePath.Length).TrimStart('/')
-        $itemType     = if ($fsObjType -eq 1) { "Folder" } else { "File" }
+        if ($null -ne $files) {
+            foreach ($file in $files) {
+                $fileRef = ""
+                if ($file.PSObject.Properties.Name -contains "ServerRelativeUrl") {
+                    $fileRef = [string]$file.ServerRelativeUrl
+                }
+                elseif ($file.PSObject.Properties.Name -contains "FieldValues") {
+                    $fileRef = [string]$file.FieldValues["FileRef"]
+                }
 
-        $allItems += [PSCustomObject]@{
-            Name         = $name
-            RelativePath = $relativePath
-            Url          = $fileRef
-            Type         = $itemType
-            LastModified = $modified
+                if ([string]::IsNullOrWhiteSpace($fileRef)) {
+                    continue
+                }
+
+                if (-not $fileRef.StartsWith($rootServerRelativePath + "/", [System.StringComparison]::OrdinalIgnoreCase)) {
+                    continue
+                }
+
+                $name = [string]$file.Name
+                if ([string]::IsNullOrWhiteSpace($name) -and $file.PSObject.Properties.Name -contains "FieldValues") {
+                    $name = [string]$file.FieldValues["FileLeafRef"]
+                }
+
+                $modified = $null
+                if ($file.PSObject.Properties.Name -contains "TimeLastModified") {
+                    $modified = $file.TimeLastModified
+                }
+                elseif ($file.PSObject.Properties.Name -contains "Modified") {
+                    $modified = $file.Modified
+                }
+                elseif ($file.PSObject.Properties.Name -contains "FieldValues") {
+                    $modified = $file.FieldValues["Modified"]
+                }
+
+                $relativePath = $fileRef.Substring($rootServerRelativePath.Length).TrimStart('/')
+                $allItems += [PSCustomObject]@{
+                    Name         = $name
+                    RelativePath = $relativePath
+                    Url          = $fileRef
+                    Type         = "File"
+                    LastModified = $modified
+                }
+            }
+        }
+
+        if ($null -ne $subFolders) {
+            foreach ($subFolder in $subFolders) {
+                $folderName = [string]$subFolder.Name
+                if ($folderName -eq "Forms") {
+                    continue
+                }
+
+                $folderRef = ""
+                if ($subFolder.PSObject.Properties.Name -contains "ServerRelativeUrl") {
+                    $folderRef = [string]$subFolder.ServerRelativeUrl
+                }
+                elseif ($subFolder.PSObject.Properties.Name -contains "FieldValues") {
+                    $folderRef = [string]$subFolder.FieldValues["FileRef"]
+                }
+
+                if ([string]::IsNullOrWhiteSpace($folderRef)) {
+                    continue
+                }
+
+                if ($folderRef.Equals($rootServerRelativePath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    continue
+                }
+
+                if ($folderRef.StartsWith($rootServerRelativePath + "/", [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $relativePath = $folderRef.Substring($rootServerRelativePath.Length).TrimStart('/')
+                    $folderModified = $null
+                    if ($subFolder.PSObject.Properties.Name -contains "TimeLastModified") {
+                        $folderModified = $subFolder.TimeLastModified
+                    }
+                    elseif ($subFolder.PSObject.Properties.Name -contains "Modified") {
+                        $folderModified = $subFolder.Modified
+                    }
+                    elseif ($subFolder.PSObject.Properties.Name -contains "FieldValues") {
+                        $folderModified = $subFolder.FieldValues["Modified"]
+                    }
+
+                    $allItems += [PSCustomObject]@{
+                        Name         = $folderName
+                        RelativePath = $relativePath
+                        Url          = $folderRef
+                        Type         = "Folder"
+                        LastModified = $folderModified
+                    }
+
+                    $childSiteRelative = Get-SiteRelativePathFromUrl -Url $folderRef -SiteUrl $TargetSiteUrl
+                    if (-not [string]::IsNullOrWhiteSpace($childSiteRelative)) {
+                        $queue.Enqueue($childSiteRelative)
+                    }
+                }
+            }
         }
     }
 
-    Write-Log "Target (paged): $($allItems.Count) items retrieved from '$FolderUrl'"
+    Write-Log "Target (folder-by-folder): $($allItems.Count) items retrieved from '$FolderUrl'"
     return $allItems
 }
 
