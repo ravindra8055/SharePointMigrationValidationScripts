@@ -352,13 +352,6 @@ function Get-LibraryFolderUrls {
         else {
             $scopeRootSiteRelativeUrl = $scopeRootServerRelativeUrl.TrimStart('/')
         }
-
-        try {
-            $null = Get-PnPFolder -Url $scopeRootSiteRelativeUrl -ErrorAction Stop
-        }
-        catch {
-            throw "Root-level folder '$FolderName' was not found in library '$LibraryName'."
-        }
     }
 
     if ([string]::IsNullOrWhiteSpace($FolderName)) {
@@ -390,6 +383,49 @@ function Get-LibraryFolderUrls {
     $connection = Get-PnPConnection -ErrorAction Stop
     $clientContext = $connection.Context
     $clientList = $clientContext.Web.Lists.GetByTitle($LibraryName)
+
+    if (-not [string]::IsNullOrWhiteSpace($FolderName)) {
+        $folderVerificationCaml = @"
+<View Scope='RecursiveAll'>
+    <ViewFields>
+        <FieldRef Name='ID' />
+        <FieldRef Name='FileRef' />
+        <FieldRef Name='FSObjType' />
+    </ViewFields>
+    <Query>
+        <Where>
+            <And>
+                <Eq>
+                    <FieldRef Name='FileRef' />
+                    <Value Type='Text'>$scopeRootServerRelativeUrl</Value>
+                </Eq>
+                <Eq>
+                    <FieldRef Name='FSObjType' />
+                    <Value Type='Integer'>1</Value>
+                </Eq>
+            </And>
+        </Where>
+    </Query>
+    <RowLimit>1</RowLimit>
+</View>
+"@
+
+        $folderVerifyQuery = New-Object Microsoft.SharePoint.Client.CamlQuery
+        $folderVerifyQuery.ViewXml = $folderVerificationCaml
+        $folderCheckItems = $clientList.GetItems($folderVerifyQuery)
+        $clientContext.Load($folderCheckItems)
+        
+        try {
+            Invoke-CSOMExecuteQueryWithRetry -ClientContext $clientContext -OperationName "Verify scoped root folder '$FolderName' exists"
+        }
+        catch {
+            throw "Failed to verify root-level folder '$FolderName' in library '$LibraryName': $_"
+        }
+
+        if ($folderCheckItems.Count -eq 0) {
+            throw "Root-level folder '$FolderName' was not found in library '$LibraryName'."
+        }
+    }
 
     do {
         $camlQuery = New-Object Microsoft.SharePoint.Client.CamlQuery
