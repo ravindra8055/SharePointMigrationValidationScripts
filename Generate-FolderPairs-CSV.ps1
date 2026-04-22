@@ -1,0 +1,459 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Generates folder-pair CSV rows from SharePoint Online document libraries.
+
+.DESCRIPTION
+    Reads a CSV file with SharePoint Online site URLs and library names, then enumerates
+    all nested folders from each library using PnP PowerShell.
+
+    Output is generated in two files:
+    1) FolderPairs_*.csv with SourceFolderUrl and TargetFolderUrl columns.
+       SourceFolderUrl is left blank so it can be filled later for migration mapping.
+    2) Results_*.csv with per-row processing status.
+
+    A Summary_*.json file is also generated.
+
+.PARAMETER CsvInputPath
+    Path to CSV file with required columns: SiteUrl, LibraryName.
+
+.PARAMETER ClientId
+    Azure AD app client ID for SPO PnP authentication.
+
+.PARAMETER TargetUsername
+    SPO username for authentication (hardcoded credential).
+
+.PARAMETER TargetPassword
+    SPO password for authentication (hardcoded credential).
+
+.PARAMETER QueryPageSize
+    Page size for list item retrieval.
+    Default: 2000
+
+.PARAMETER OutputFolder
+    Folder path for output files.
+    Default: ./GenerateFolderPairsLog-{timestamp}
+
+.EXAMPLE
+    .\Generate-FolderPairs-CSV.ps1 `
+        -CsvInputPath ".\LibraryFolders-Template.csv" `
+        -ClientId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+        -TargetUsername "admin@tenant.onmicrosoft.com" `
+        -TargetPassword "Password123!"
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$CsvInputPath,
+
+    [Parameter(Mandatory = $true)]
+    [string]$ClientId,
+
+    [Parameter(Mandatory = $true)]
+    [string]$TargetUsername,
+
+    [Parameter(Mandatory = $true)]
+    [string]$TargetPassword,
+
+    [int]$QueryPageSize = 2000,
+
+    [string]$OutputFolder = "./GenerateFolderPairsLog-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Continue"
+
+# ==========================================
+# Global Variables & Initialization
+# ==========================================
+$script:Results = @()
+$script:FolderPairs = @()
+$script:ProcessedRows = 0
+$script:SuccessfulRows = 0
+$script:FailedRows = 0
+$script:TotalRows = 0
+$script:Credential = $null
+$script:TotalFoldersDiscovered = 0
+
+if (-not (Test-Path $CsvInputPath)) {
+    throw "CSV input file not found: $CsvInputPath"
+}
+
+if ($QueryPageSize -le 0) {
+    throw "QueryPageSize must be greater than 0."
+}
+
+if (-not (Test-Path $OutputFolder)) {
+    New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+    Write-Host "Created output folder: $OutputFolder"
+}
+
+# ==========================================
+# Function: Initialize Credential
+# ==========================================
+function Initialize-Credential {
+    [CmdletBinding()]
+    param()
+
+    $securePassword = ConvertTo-SecureString $TargetPassword -AsPlainText -Force
+    $script:Credential = New-Object System.Management.Automation.PSCredential($TargetUsername, $securePassword)
+}
+
+# ==========================================
+# Function: Connect to SPO Site
+# ==========================================
+function Get-PnPConnectionForSite {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SiteUrl
+    )
+
+    try {
+        Write-Verbose "Connecting to $SiteUrl"
+        Connect-PnPOnline -Url $SiteUrl -Credentials $script:Credential -ClientId $ClientId -ErrorAction Stop
+        Write-Host "Connected: $SiteUrl"
+    }
+    catch {
+        throw "Failed to connect to site $SiteUrl : $_"
+    }
+}
+
+# ==========================================
+# Function: Validate CSV Columns
+# ==========================================
+function Test-CsvFormat {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [array]$Rows
+    )
+
+    if ($Rows.Count -eq 0) {
+        throw "CSV file is empty: $CsvInputPath"
+    }
+
+    $first = $Rows[0]
+    $requiredColumns = @("SiteUrl", "LibraryName")
+
+    foreach ($column in $requiredColumns) {
+        if (-not ($first.PSObject.Properties.Name -contains $column)) {
+            throw "CSV must contain required column: $column"
+        }
+    }
+}
+
+# ==========================================
+# Function: Disconnect SPO Connection
+# ==========================================
+function Disconnect-PnPIfConnected {
+    [CmdletBinding()]
+    param()
+
+    try {
+        $existingConnection = Get-PnPConnection -ErrorAction SilentlyContinue
+        if ($null -ne $existingConnection) {
+            Disconnect-PnPOnline -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+        # Intentionally suppress disconnect errors when no active connection exists.
+    }
+}
+
+# ==========================================
+# Function: Validate CSV Row
+# ==========================================
+function Test-CsvRow {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$Row
+    )
+
+    $errors = @()
+
+    if ([string]::IsNullOrWhiteSpace($Row.SiteUrl)) {
+        $errors += "SiteUrl is empty"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Row.LibraryName)) {
+        $errors += "LibraryName is empty"
+    }
+
+    if ($errors.Count -gt 0) {
+        return @{
+            IsValid = $false
+            Errors = ($errors -join "; ")
+        }
+    }
+
+    return @{
+        IsValid = $true
+        Errors = ""
+    }
+}
+
+# ==========================================
+# Function: Get Library Folder URLs
+# ==========================================
+function Get-LibraryFolderUrls {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SiteUrl,
+
+        [Parameter(Mandatory = $true)]
+        [string]$LibraryName
+    )
+
+    $list = $null
+    $rootServerRelativeUrl = ""
+    $folderUrls = New-Object System.Collections.ArrayList
+
+    try {
+        $list = Get-PnPList -Identity $LibraryName -Includes RootFolder -ErrorAction Stop
+    }
+    catch {
+        throw "Library '$LibraryName' not found at '$SiteUrl'. $_"
+    }
+
+    if ($null -eq $list -or $null -eq $list.RootFolder) {
+        throw "Unable to retrieve root folder for library '$LibraryName'."
+    }
+
+    $rootServerRelativeUrl = [string]$list.RootFolder.ServerRelativeUrl
+    [void]$folderUrls.Add($rootServerRelativeUrl)
+
+    $camlQuery = @"
+<View Scope='RecursiveAll'>
+    <ViewFields>
+        <FieldRef Name='FileRef' />
+        <FieldRef Name='FileLeafRef' />
+    </ViewFields>
+    <Query>
+        <Where>
+            <Eq>
+                <FieldRef Name='FSObjType' />
+                <Value Type='Integer'>1</Value>
+            </Eq>
+        </Where>
+        <OrderBy Override='TRUE'>
+            <FieldRef Name='FileRef' Ascending='TRUE' />
+        </OrderBy>
+    </Query>
+    <RowLimit Paged='TRUE'>$($QueryPageSize)</RowLimit>
+</View>
+"@
+
+    $folderItems = @(Get-PnPListItem -List $LibraryName -Query $camlQuery -PageSize $QueryPageSize -ErrorAction Stop)
+
+    foreach ($item in $folderItems) {
+        $fileRef = [string]$item["FileRef"]
+        $leafName = [string]$item["FileLeafRef"]
+
+        if ([string]::IsNullOrWhiteSpace($fileRef)) {
+            continue
+        }
+
+        if ($leafName -eq "Forms") {
+            continue
+        }
+
+        if ($fileRef.Equals($rootServerRelativeUrl, [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+
+        [void]$folderUrls.Add($fileRef)
+    }
+
+    return @($folderUrls | Sort-Object -Unique)
+}
+
+# ==========================================
+# Function: Process Single Row
+# ==========================================
+function Invoke-GenerateFolderPairsForRow {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$RowIndex,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SiteUrl,
+
+        [Parameter(Mandatory = $true)]
+        [string]$LibraryName
+    )
+
+    $rowResult = $null
+    $folderUrls = @()
+    $folderCount = 0
+
+    try {
+        Get-PnPConnectionForSite -SiteUrl $SiteUrl
+        $folderUrls = @(Get-LibraryFolderUrls -SiteUrl $SiteUrl -LibraryName $LibraryName)
+        $folderCount = $folderUrls.Count
+
+        foreach ($folderUrl in $folderUrls) {
+            $targetFolderUrl = $SiteUrl.TrimEnd('/') + $folderUrl
+            $script:FolderPairs += [PSCustomObject]@{
+                SourceFolderUrl = ""
+                TargetFolderUrl = $targetFolderUrl
+                SiteUrl = $SiteUrl
+                LibraryName = $LibraryName
+                Timestamp = (Get-Date).ToString("s")
+            }
+        }
+
+        $script:TotalFoldersDiscovered += $folderCount
+
+        $rowResult = [PSCustomObject]@{
+            RowNumber = $RowIndex
+            SiteUrl = $SiteUrl
+            LibraryName = $LibraryName
+            Status = "Completed"
+            IsSuccessful = $true
+            FolderCount = $folderCount
+            Message = "Discovered $folderCount folder(s), including nested folders."
+            Timestamp = (Get-Date).ToString("s")
+        }
+    }
+    catch {
+        $rowResult = [PSCustomObject]@{
+            RowNumber = $RowIndex
+            SiteUrl = $SiteUrl
+            LibraryName = $LibraryName
+            Status = "Failed"
+            IsSuccessful = $false
+            FolderCount = 0
+            Message = $_.Exception.Message
+            Timestamp = (Get-Date).ToString("s")
+        }
+    }
+    finally {
+        Disconnect-PnPIfConnected
+    }
+
+    return $rowResult
+}
+
+# ==========================================
+# Function: Main Processing Function
+# ==========================================
+function Invoke-MainFunction {
+    [CmdletBinding()]
+    param()
+
+    Write-Host "Reading CSV file: $CsvInputPath"
+    $rows = Import-Csv -Path $CsvInputPath -Encoding UTF8
+
+    Write-Host "Validating CSV format..."
+    Test-CsvFormat -Rows $rows
+    $script:TotalRows = $rows.Count
+
+    Write-Host "Processing $($rows.Count) row(s)..."
+
+    for ($rowIndex = 0; $rowIndex -lt $rows.Count; $rowIndex++) {
+        $row = $rows[$rowIndex]
+        $displayRowNumber = $rowIndex + 1
+
+        $validation = Test-CsvRow -Row $row
+        if (-not $validation.IsValid) {
+            $script:Results += [PSCustomObject]@{
+                RowNumber = $displayRowNumber
+                SiteUrl = $row.SiteUrl
+                LibraryName = $row.LibraryName
+                Status = "Failed"
+                IsSuccessful = $false
+                FolderCount = 0
+                Message = $validation.Errors
+                Timestamp = (Get-Date).ToString("s")
+            }
+
+            $script:FailedRows++
+            $script:ProcessedRows++
+            Write-Warning "Row $displayRowNumber validation failed: $($validation.Errors)"
+            continue
+        }
+
+        Write-Host "Processing row $displayRowNumber of $($rows.Count)..."
+
+        $result = Invoke-GenerateFolderPairsForRow -RowIndex $displayRowNumber -SiteUrl ([string]$row.SiteUrl).Trim() -LibraryName ([string]$row.LibraryName).Trim()
+        $script:Results += $result
+
+        if ($result.IsSuccessful) {
+            $script:SuccessfulRows++
+        }
+        else {
+            $script:FailedRows++
+        }
+
+        $script:ProcessedRows++
+        Start-Sleep -Milliseconds 250
+    }
+}
+
+# ==========================================
+# Main Execution
+# ==========================================
+$startTime = Get-Date
+
+try {
+    Write-Host "Starting Generate FolderPairs CSV script (SPO-only)..." -ForegroundColor Cyan
+    Initialize-Credential
+    Invoke-MainFunction
+
+    $endTime = Get-Date
+    $duration = $endTime - $startTime
+
+    $folderPairsFile = Join-Path $OutputFolder "FolderPairs_$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+    $resultFile = Join-Path $OutputFolder "Results_$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+    $summaryFile = Join-Path $OutputFolder "Summary_$(Get-Date -Format 'yyyyMMdd-HHmmss').json"
+
+    Write-Host "Exporting generated folder pairs to CSV..."
+    $script:FolderPairs | Select-Object SourceFolderUrl, TargetFolderUrl | Export-Csv -Path $folderPairsFile -NoTypeInformation -Encoding UTF8 -Force
+
+    Write-Host "Exporting row results to CSV..."
+    $script:Results | Export-Csv -Path $resultFile -NoTypeInformation -Encoding UTF8 -Force
+
+    $summary = @{
+        ExecutionTime = "$($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s"
+        TotalRows = $script:TotalRows
+        ProcessedRows = $script:ProcessedRows
+        SuccessfulRows = $script:SuccessfulRows
+        FailedRows = $script:FailedRows
+        TotalFoldersDiscovered = $script:TotalFoldersDiscovered
+        FolderPairsFile = $folderPairsFile
+        ResultFile = $resultFile
+        TimestampStart = $startTime.ToString("s")
+        TimestampEnd = $endTime.ToString("s")
+    }
+
+    Write-Host "Exporting summary to JSON..."
+    $summary | ConvertTo-Json | Set-Content -Path $summaryFile -Encoding UTF8
+
+    Write-Host ""
+    Write-Host "==========================================" -ForegroundColor Cyan
+    Write-Host "Generate FolderPairs CSV Summary" -ForegroundColor Cyan
+    Write-Host "==========================================" -ForegroundColor Cyan
+    Write-Host "Total Rows:               $($summary.TotalRows)"
+    Write-Host "Processed Rows:           $($summary.ProcessedRows)"
+    Write-Host "Successful Rows:          $($summary.SuccessfulRows)" -ForegroundColor Green
+    Write-Host "Failed Rows:              $($summary.FailedRows)" -ForegroundColor $(if ($summary.FailedRows -gt 0) { "Red" } else { "Green" })
+    Write-Host "Total Folders Discovered: $($summary.TotalFoldersDiscovered)" -ForegroundColor Green
+    Write-Host "FolderPairs CSV:          $folderPairsFile"
+    Write-Host "Results CSV:              $resultFile"
+    Write-Host "Summary JSON:             $summaryFile"
+    Write-Host "Execution Time:           $($summary.ExecutionTime)"
+    Write-Host "==========================================" -ForegroundColor Cyan
+}
+catch {
+    Write-Error "Fatal error: $_"
+    exit 1
+}
+finally {
+    Disconnect-PnPIfConnected
+    Write-Host "Script execution completed." -ForegroundColor Cyan
+}
