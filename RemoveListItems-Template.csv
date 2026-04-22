@@ -1,0 +1,4 @@
+SiteUrl,ListName,DateThreshold,DateCondition
+https://tenant.sharepoint.com/sites/Finance,Invoices,2025-01-01,Before
+https://tenant.sharepoint.com/sites/HR,Employees,2024-06-30,After
+https://tenant.sharepoint.com/sites/IT,RequestLog,2023-12-31,Before
