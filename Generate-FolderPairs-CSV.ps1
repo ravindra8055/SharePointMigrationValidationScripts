@@ -7,6 +7,10 @@
     Reads a CSV file with SharePoint Online site URLs and library names, then enumerates
     all nested folders from each library using PnP PowerShell.
 
+    Input CSV supports an additional FolderName column.
+    - If FolderName has a value, only that root-level folder and its nested folders are queried.
+    - If FolderName is empty, all folders in the library are queried.
+
     Output is generated in two files:
     1) FolderPairs_*.csv with TargetFolderUrl and ItemsCount columns.
     2) Results_*.csv with per-row processing status.
@@ -14,7 +18,7 @@
     A Summary_*.json file is also generated.
 
 .PARAMETER CsvInputPath
-    Path to CSV file with required columns: SiteUrl, LibraryName.
+    Path to CSV file with required columns: SiteUrl, LibraryName, FolderName.
 
 .PARAMETER ClientId
     Azure AD app client ID for SPO PnP authentication.
@@ -154,7 +158,7 @@ function Test-CsvFormat {
     }
 
     $first = $Rows[0]
-    $requiredColumns = @("SiteUrl", "LibraryName")
+    $requiredColumns = @("SiteUrl", "LibraryName", "FolderName")
 
     foreach ($column in $requiredColumns) {
         if (-not ($first.PSObject.Properties.Name -contains $column)) {
@@ -303,7 +307,9 @@ function Get-LibraryFolderUrls {
         [string]$SiteUrl,
 
         [Parameter(Mandatory = $true)]
-        [string]$LibraryName
+        [string]$LibraryName,
+
+        [string]$FolderName = ""
     )
 
     $list = $null
@@ -318,6 +324,10 @@ function Get-LibraryFolderUrls {
     $listItemPosition = $null
     $currentPageItems = $null
     $scannedItemCount = 0
+    $scopeRootServerRelativeUrl = ""
+    $scopeRootSiteRelativeUrl = ""
+    $rootSubFolders = @()
+    $matchingRootFolder = $null
 
     try {
         $list = Get-PnPList -Identity $LibraryName -Includes RootFolder -ErrorAction Stop
@@ -347,9 +357,47 @@ function Get-LibraryFolderUrls {
         $rootSiteRelativeUrl = $rootServerRelativeUrl.TrimStart('/')
     }
 
-    $rootItemCount = Get-DirectChildItemCount -FolderSiteRelativeUrl $rootSiteRelativeUrl
+    $scopeRootServerRelativeUrl = $rootServerRelativeUrl
+    $scopeRootSiteRelativeUrl = $rootSiteRelativeUrl
+
+    if (-not [string]::IsNullOrWhiteSpace($FolderName)) {
+        $rootSubFolders = @(Get-PnPFolderItem -FolderSiteRelativeUrl $rootSiteRelativeUrl -ItemType Folder -ErrorAction Stop)
+        $matchingRootFolder = $rootSubFolders | Where-Object {
+            $_.Name -and $_.Name.Equals($FolderName.Trim(), [System.StringComparison]::OrdinalIgnoreCase)
+        } | Select-Object -First 1
+
+        if ($null -eq $matchingRootFolder) {
+            throw "Root-level folder '$FolderName' was not found in library '$LibraryName'."
+        }
+
+        if ($matchingRootFolder.PSObject.Properties.Name -contains "ServerRelativeUrl") {
+            $scopeRootServerRelativeUrl = [string]$matchingRootFolder.ServerRelativeUrl
+        }
+        elseif ($matchingRootFolder.PSObject.Properties.Name -contains "FieldValues") {
+            $scopeRootServerRelativeUrl = [string]$matchingRootFolder.FieldValues["FileRef"]
+        }
+
+        if ([string]::IsNullOrWhiteSpace($scopeRootServerRelativeUrl)) {
+            throw "Unable to resolve server relative URL for root folder '$FolderName' in library '$LibraryName'."
+        }
+
+        if ($webServerRelativeUrl -eq "/") {
+            $scopeRootSiteRelativeUrl = $scopeRootServerRelativeUrl.TrimStart('/')
+        }
+        elseif ($scopeRootServerRelativeUrl.StartsWith($webServerRelativeUrl + "/", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $scopeRootSiteRelativeUrl = $scopeRootServerRelativeUrl.Substring($webServerRelativeUrl.Length + 1)
+        }
+        elseif ($scopeRootServerRelativeUrl.Equals($webServerRelativeUrl, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $scopeRootSiteRelativeUrl = ""
+        }
+        else {
+            $scopeRootSiteRelativeUrl = $scopeRootServerRelativeUrl.TrimStart('/')
+        }
+    }
+
+    $rootItemCount = Get-DirectChildItemCount -FolderSiteRelativeUrl $scopeRootSiteRelativeUrl
     [void]$folderRows.Add([PSCustomObject]@{
-        TargetFolderUrl = $SiteUrl.TrimEnd('/') + $rootServerRelativeUrl
+        TargetFolderUrl = $SiteUrl.TrimEnd('/') + $scopeRootServerRelativeUrl
         ItemsCount = [int]$rootItemCount
     })
 
@@ -403,8 +451,8 @@ function Get-LibraryFolderUrls {
             }
 
             if (
-                -not $fileRef.Equals($rootServerRelativeUrl, [System.StringComparison]::OrdinalIgnoreCase) -and
-                -not $fileRef.StartsWith($rootServerRelativeUrl + "/", [System.StringComparison]::OrdinalIgnoreCase)
+                -not $fileRef.Equals($scopeRootServerRelativeUrl, [System.StringComparison]::OrdinalIgnoreCase) -and
+                -not $fileRef.StartsWith($scopeRootServerRelativeUrl + "/", [System.StringComparison]::OrdinalIgnoreCase)
             ) {
                 continue
             }
@@ -414,7 +462,7 @@ function Get-LibraryFolderUrls {
                 continue
             }
 
-            if ($fileRef.Equals($rootServerRelativeUrl, [System.StringComparison]::OrdinalIgnoreCase)) {
+            if ($fileRef.Equals($scopeRootServerRelativeUrl, [System.StringComparison]::OrdinalIgnoreCase)) {
                 continue
             }
 
@@ -457,6 +505,9 @@ function Invoke-GenerateFolderPairsForRow {
 
         [Parameter(Mandatory = $true)]
         [string]$LibraryName
+
+        ,
+        [string]$FolderName = ""
     )
 
     $rowResult = $null
@@ -465,15 +516,16 @@ function Invoke-GenerateFolderPairsForRow {
 
     try {
         Get-PnPConnectionForSite -SiteUrl $SiteUrl
-        $folderRows = @(Get-LibraryFolderUrls -SiteUrl $SiteUrl -LibraryName $LibraryName)
+        $folderRows = @(Get-LibraryFolderUrls -SiteUrl $SiteUrl -LibraryName $LibraryName -FolderName $FolderName)
         $folderCount = $folderRows.Count
 
         foreach ($folderRow in $folderRows) {
             $script:FolderPairs += [PSCustomObject]@{
-            TargetFolderUrl = $folderRow.TargetFolderUrl
-            ItemsCount = [int]$folderRow.ItemsCount
+                TargetFolderUrl = $folderRow.TargetFolderUrl
+                ItemsCount = [int]$folderRow.ItemsCount
                 SiteUrl = $SiteUrl
                 LibraryName = $LibraryName
+                FolderName = $FolderName
                 Timestamp = (Get-Date).ToString("s")
             }
         }
@@ -484,6 +536,7 @@ function Invoke-GenerateFolderPairsForRow {
             RowNumber = $RowIndex
             SiteUrl = $SiteUrl
             LibraryName = $LibraryName
+            FolderName = $FolderName
             Status = "Completed"
             IsSuccessful = $true
             FolderCount = $folderCount
@@ -496,6 +549,7 @@ function Invoke-GenerateFolderPairsForRow {
             RowNumber = $RowIndex
             SiteUrl = $SiteUrl
             LibraryName = $LibraryName
+            FolderName = $FolderName
             Status = "Failed"
             IsSuccessful = $false
             FolderCount = 0
@@ -536,6 +590,7 @@ function Invoke-MainFunction {
                 RowNumber = $displayRowNumber
                 SiteUrl = $row.SiteUrl
                 LibraryName = $row.LibraryName
+                FolderName = $row.FolderName
                 Status = "Failed"
                 IsSuccessful = $false
                 FolderCount = 0
@@ -551,7 +606,7 @@ function Invoke-MainFunction {
 
         Write-Host "Processing row $displayRowNumber of $($rows.Count)..."
 
-        $result = Invoke-GenerateFolderPairsForRow -RowIndex $displayRowNumber -SiteUrl ([string]$row.SiteUrl).Trim() -LibraryName ([string]$row.LibraryName).Trim()
+        $result = Invoke-GenerateFolderPairsForRow -RowIndex $displayRowNumber -SiteUrl ([string]$row.SiteUrl).Trim() -LibraryName ([string]$row.LibraryName).Trim() -FolderName ([string]$row.FolderName).Trim()
         $script:Results += $result
 
         if ($result.IsSuccessful) {
