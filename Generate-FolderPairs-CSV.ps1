@@ -271,86 +271,6 @@ function Test-CsvRow {
 }
 
 # ==========================================
-# Function: Get Direct Child Item Count
-# ==========================================
-function Get-DirectChildItemCount {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$ListName,
-
-        [Parameter(Mandatory = $true)]
-        [string]$FolderServerRelativeUrl
-    )
-
-    $connection = $null
-    $clientContext = $null
-    $clientList = $null
-    $listItemPosition = $null
-    $currentPageItems = $null
-    $itemCount = 0
-    $escapedFolderPath = ""
-    $directChildrenCaml = ""
-
-    $escapedFolderPath = [System.Security.SecurityElement]::Escape($FolderServerRelativeUrl)
-
-    $directChildrenCaml = @"
-<View Scope='RecursiveAll'>
-    <ViewFields>
-        <FieldRef Name='ID' />
-        <FieldRef Name='FileLeafRef' />
-        <FieldRef Name='FSObjType' />
-    </ViewFields>
-    <Query>
-        <Where>
-            <Eq>
-                <FieldRef Name='FileDirRef' />
-                <Value Type='Lookup'>$escapedFolderPath</Value>
-            </Eq>
-        </Where>
-        <OrderBy Override='TRUE'>
-            <FieldRef Name='ID' Ascending='TRUE' />
-        </OrderBy>
-    </Query>
-    <RowLimit Paged='TRUE'>$($QueryPageSize)</RowLimit>
-</View>
-"@
-
-    $connection = Get-PnPConnection -ErrorAction Stop
-    $clientContext = $connection.Context
-    $clientList = $clientContext.Web.Lists.GetByTitle($ListName)
-
-    do {
-        $camlQuery = New-Object Microsoft.SharePoint.Client.CamlQuery
-        $camlQuery.ViewXml = $directChildrenCaml
-        $camlQuery.ListItemCollectionPosition = $listItemPosition
-
-        $currentPageItems = $clientList.GetItems($camlQuery)
-        $clientContext.Load($currentPageItems)
-        Invoke-CSOMExecuteQueryWithRetry -ClientContext $clientContext -OperationName "Direct child count: $ListName"
-
-        foreach ($item in $currentPageItems) {
-            $leafName = [string]$item["FileLeafRef"]
-            $fsObjType = 0
-            if ($null -ne $item["FSObjType"] -and $item["FSObjType"].ToString() -ne "") {
-                $fsObjType = [int]$item["FSObjType"]
-            }
-
-            if ($leafName -eq "Forms" -and $fsObjType -eq 1) {
-                continue
-            }
-
-            $itemCount++
-        }
-
-        $listItemPosition = $currentPageItems.ListItemCollectionPosition
-    }
-    while ($null -ne $listItemPosition)
-
-    return $itemCount
-}
-
-# ==========================================
 # Function: Get Library Folder URLs
 # ==========================================
 function Get-LibraryFolderUrls {
@@ -369,8 +289,6 @@ function Get-LibraryFolderUrls {
     $rootServerRelativeUrl = ""
     $folderRows = New-Object System.Collections.ArrayList
     $web = $null
-    $rootSiteRelativeUrl = ""
-    $rootItemCount = 0
     $connection = $null
     $clientContext = $null
     $clientList = $null
@@ -379,10 +297,7 @@ function Get-LibraryFolderUrls {
     $scannedItemCount = 0
     $scopeRootServerRelativeUrl = ""
     $scopeRootSiteRelativeUrl = ""
-    $matchingRootFolderItem = $null
-    $rootFolderLookupCaml = ""
-    $escapedRootPath = ""
-    $escapedFolderName = ""
+    $folderNameSegment = ""
 
     try {
         $list = Get-PnPList -Identity $LibraryName -Includes RootFolder -ErrorAction Stop
@@ -399,67 +314,27 @@ function Get-LibraryFolderUrls {
     $rootServerRelativeUrl = [string]$list.RootFolder.ServerRelativeUrl
 
     $webServerRelativeUrl = [string]$web.ServerRelativeUrl
+    $scopeRootServerRelativeUrl = $rootServerRelativeUrl
     if ($webServerRelativeUrl -eq "/") {
-        $rootSiteRelativeUrl = $rootServerRelativeUrl.TrimStart('/')
+        $scopeRootSiteRelativeUrl = $scopeRootServerRelativeUrl.TrimStart('/')
     }
-    elseif ($rootServerRelativeUrl.StartsWith($webServerRelativeUrl + "/", [System.StringComparison]::OrdinalIgnoreCase)) {
-        $rootSiteRelativeUrl = $rootServerRelativeUrl.Substring($webServerRelativeUrl.Length + 1)
+    elseif ($scopeRootServerRelativeUrl.StartsWith($webServerRelativeUrl + "/", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $scopeRootSiteRelativeUrl = $scopeRootServerRelativeUrl.Substring($webServerRelativeUrl.Length + 1)
     }
-    elseif ($rootServerRelativeUrl.Equals($webServerRelativeUrl, [System.StringComparison]::OrdinalIgnoreCase)) {
-        $rootSiteRelativeUrl = ""
+    elseif ($scopeRootServerRelativeUrl.Equals($webServerRelativeUrl, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $scopeRootSiteRelativeUrl = ""
     }
     else {
-        $rootSiteRelativeUrl = $rootServerRelativeUrl.TrimStart('/')
+        $scopeRootSiteRelativeUrl = $scopeRootServerRelativeUrl.TrimStart('/')
     }
 
-    $scopeRootServerRelativeUrl = $rootServerRelativeUrl
-    $scopeRootSiteRelativeUrl = $rootSiteRelativeUrl
-
     if (-not [string]::IsNullOrWhiteSpace($FolderName)) {
-        $escapedRootPath = [System.Security.SecurityElement]::Escape($rootServerRelativeUrl)
-        $escapedFolderName = [System.Security.SecurityElement]::Escape($FolderName.Trim())
-
-        $rootFolderLookupCaml = @"
-<View Scope='RecursiveAll'>
-    <ViewFields>
-        <FieldRef Name='ID' />
-        <FieldRef Name='FileRef' />
-        <FieldRef Name='FileLeafRef' />
-    </ViewFields>
-    <Query>
-        <Where>
-            <And>
-                <Eq>
-                    <FieldRef Name='FSObjType' />
-                    <Value Type='Integer'>1</Value>
-                </Eq>
-                <And>
-                    <Eq>
-                        <FieldRef Name='FileDirRef' />
-                        <Value Type='Lookup'>$escapedRootPath</Value>
-                    </Eq>
-                    <Eq>
-                        <FieldRef Name='FileLeafRef' />
-                        <Value Type='Text'>$escapedFolderName</Value>
-                    </Eq>
-                </And>
-            </And>
-        </Where>
-        <OrderBy Override='TRUE'>
-            <FieldRef Name='ID' Ascending='TRUE' />
-        </OrderBy>
-    </Query>
-    <RowLimit Paged='TRUE'>1</RowLimit>
-</View>
-"@
-
-        $matchingRootFolderItem = @(Get-PnPListItem -List $LibraryName -Query $rootFolderLookupCaml -PageSize 1 -ErrorAction Stop) | Select-Object -First 1
-
-        if ($null -eq $matchingRootFolderItem) {
-            throw "Root-level folder '$FolderName' was not found in library '$LibraryName'."
+        $folderNameSegment = $FolderName.Trim().Trim('/').Trim('\')
+        if ([string]::IsNullOrWhiteSpace($folderNameSegment)) {
+            throw "FolderName contains only slashes/whitespace and is not valid."
         }
 
-        $scopeRootServerRelativeUrl = [string]$matchingRootFolderItem["FileRef"]
+        $scopeRootServerRelativeUrl = $rootServerRelativeUrl.TrimEnd('/') + "/" + $folderNameSegment
 
         if ([string]::IsNullOrWhiteSpace($scopeRootServerRelativeUrl)) {
             throw "Unable to resolve server relative URL for root folder '$FolderName' in library '$LibraryName'."
@@ -477,6 +352,13 @@ function Get-LibraryFolderUrls {
         else {
             $scopeRootSiteRelativeUrl = $scopeRootServerRelativeUrl.TrimStart('/')
         }
+
+        try {
+            $null = Get-PnPFolder -Url $scopeRootSiteRelativeUrl -ErrorAction Stop
+        }
+        catch {
+            throw "Root-level folder '$FolderName' was not found in library '$LibraryName'."
+        }
     }
 
     if ([string]::IsNullOrWhiteSpace($FolderName)) {
@@ -485,12 +367,6 @@ function Get-LibraryFolderUrls {
     else {
         Write-Host "Querying scoped root folder '$FolderName': $scopeRootServerRelativeUrl"
     }
-
-    $rootItemCount = Get-DirectChildItemCount -ListName $LibraryName -FolderServerRelativeUrl $scopeRootServerRelativeUrl
-    [void]$folderRows.Add([PSCustomObject]@{
-        TargetFolderUrl = $SiteUrl.TrimEnd('/') + $scopeRootServerRelativeUrl
-        ItemsCount = [int]$rootItemCount
-    })
 
     $pagedScanCaml = @"
 <View Scope='RecursiveAll'>
@@ -550,10 +426,6 @@ function Get-LibraryFolderUrls {
 
             $leafName = [string]$item["FileLeafRef"]
             if ($leafName -eq "Forms") {
-                continue
-            }
-
-            if ($fileRef.Equals($scopeRootServerRelativeUrl, [System.StringComparison]::OrdinalIgnoreCase)) {
                 continue
             }
 
