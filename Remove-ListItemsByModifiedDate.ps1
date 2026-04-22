@@ -69,6 +69,7 @@ $script:FailedRows      = 0
 $script:Credential      = $null
 $script:ItemsRecycled   = 0
 $script:TotalRows       = 0
+$script:QueryPageSize   = 500
 
 if (-not (Test-Path $CsvInputPath)) {
     throw "CSV input file not found: $CsvInputPath"
@@ -209,6 +210,32 @@ function Test-CsvRow {
 }
 
 # ==========================================
+# Function: Get Modified Field Index State
+# ==========================================
+function Get-ModifiedFieldIndexState {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ListName
+    )
+
+    $modifiedField = $null
+
+    try {
+        $modifiedField = Get-PnPField -List $ListName -Identity "Modified" -Includes Indexed -ErrorAction Stop
+    }
+    catch {
+        throw "Unable to inspect the 'Modified' field for list '$ListName' : $_"
+    }
+
+    if ($null -eq $modifiedField) {
+        throw "Could not retrieve the 'Modified' field definition for list '$ListName'."
+    }
+
+    return [bool]$modifiedField.Indexed
+}
+
+# ==========================================
 # Function: Build CAML Query for Date Filtering
 # ==========================================
 function Build-DateFilterCAML {
@@ -230,16 +257,24 @@ function Build-DateFilterCAML {
         $operator = "Gt"
     }
 
-    $camlQuery = @"
-<View>
+        $camlQuery = @"
+<View Scope="RecursiveAll">
+    <ViewFields>
+        <FieldRef Name="ID" />
+        <FieldRef Name="Modified" />
+    </ViewFields>
   <Query>
     <Where>
       <$operator>
         <FieldRef Name="Modified" />
-        <Value Type="DateTime">$dateString</Value>
+                <Value IncludeTimeValue="TRUE" Type="DateTime">$dateString</Value>
       </$operator>
     </Where>
+        <OrderBy Override="TRUE">
+            <FieldRef Name="ID" Ascending="TRUE" />
+        </OrderBy>
   </Query>
+    <RowLimit Paged="TRUE">$($script:QueryPageSize)</RowLimit>
 </View>
 "@
 
@@ -270,6 +305,7 @@ function Invoke-RecycleListItemsByDate {
 
     $rowResult = $null
     $itemsRecycledCount = 0
+    $isModifiedIndexed = $false
 
     try {
         Get-PnPConnectionForSite -SiteUrl $SiteUrl
@@ -279,11 +315,16 @@ function Invoke-RecycleListItemsByDate {
             throw "List '$ListName' not found"
         }
 
+        $isModifiedIndexed = Get-ModifiedFieldIndexState -ListName $ListName
+        if (-not $isModifiedIndexed) {
+            throw "The 'Modified' column is not indexed in list '$ListName'. SharePoint Online blocks date queries on large lists when the filtered column is not indexed. Index the 'Modified' column and run the script again."
+        }
+
         Write-Verbose "Building CAML query for date filtering..."
         $camlQuery = Build-DateFilterCAML -DateThreshold $DateThreshold -DateCondition $DateCondition
 
         Write-Verbose "Retrieving filtered items from list: $ListName"
-        $items = Get-PnPListItem -List $ListName -Query $camlQuery -PageSize 5000 -ErrorAction Stop
+        $items = @(Get-PnPListItem -List $ListName -Query $camlQuery -PageSize $script:QueryPageSize -ErrorAction Stop)
 
         if ($null -eq $items -or $items.Count -eq 0) {
             $rowResult = [PSCustomObject]@{
@@ -330,6 +371,11 @@ function Invoke-RecycleListItemsByDate {
         $script:ItemsRecycled += $itemsRecycledCount
     }
     catch {
+        $errorMessage = $_.Exception.Message
+        if ($errorMessage -like "*exceeds the list view threshold*") {
+            $errorMessage = "$errorMessage Ensure the 'Modified' column is indexed, and keep the query filtered to indexed columns only."
+        }
+
         $rowResult = [PSCustomObject]@{
             RowNumber            = $RowIndex
             SiteUrl              = $SiteUrl
@@ -339,7 +385,7 @@ function Invoke-RecycleListItemsByDate {
             Status               = "Failed"
             IsSuccessful         = $false
             ItemsRecycled        = 0
-            Message              = $_.Exception.Message
+            Message              = $errorMessage
             Timestamp            = (Get-Date).ToString("s")
         }
     }
