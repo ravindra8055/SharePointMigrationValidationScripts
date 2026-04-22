@@ -277,42 +277,77 @@ function Get-DirectChildItemCount {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [string]$FolderSiteRelativeUrl
+        [string]$ListName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$FolderServerRelativeUrl
     )
 
-    $files = @()
-    $subFolders = @()
-    $validSubFolderCount = 0
+    $connection = $null
+    $clientContext = $null
+    $clientList = $null
+    $listItemPosition = $null
+    $currentPageItems = $null
+    $itemCount = 0
+    $escapedFolderPath = ""
+    $directChildrenCaml = ""
 
-    try {
-        $files = @(Get-PnPFolderItem -FolderSiteRelativeUrl $FolderSiteRelativeUrl -ItemType File -ErrorAction Stop)
-        $subFolders = @(Get-PnPFolderItem -FolderSiteRelativeUrl $FolderSiteRelativeUrl -ItemType Folder -ErrorAction Stop)
+    $escapedFolderPath = [System.Security.SecurityElement]::Escape($FolderServerRelativeUrl)
+
+    $directChildrenCaml = @"
+<View Scope='RecursiveAll'>
+    <ViewFields>
+        <FieldRef Name='ID' />
+        <FieldRef Name='FileLeafRef' />
+        <FieldRef Name='FSObjType' />
+    </ViewFields>
+    <Query>
+        <Where>
+            <Eq>
+                <FieldRef Name='FileDirRef' />
+                <Value Type='Lookup'>$escapedFolderPath</Value>
+            </Eq>
+        </Where>
+        <OrderBy Override='TRUE'>
+            <FieldRef Name='ID' Ascending='TRUE' />
+        </OrderBy>
+    </Query>
+    <RowLimit Paged='TRUE'>$($QueryPageSize)</RowLimit>
+</View>
+"@
+
+    $connection = Get-PnPConnection -ErrorAction Stop
+    $clientContext = $connection.Context
+    $clientList = $clientContext.Web.Lists.GetByTitle($ListName)
+
+    do {
+        $camlQuery = New-Object Microsoft.SharePoint.Client.CamlQuery
+        $camlQuery.ViewXml = $directChildrenCaml
+        $camlQuery.ListItemCollectionPosition = $listItemPosition
+
+        $currentPageItems = $clientList.GetItems($camlQuery)
+        $clientContext.Load($currentPageItems)
+        Invoke-CSOMExecuteQueryWithRetry -ClientContext $clientContext -OperationName "Direct child count: $ListName"
+
+        foreach ($item in $currentPageItems) {
+            $leafName = [string]$item["FileLeafRef"]
+            $fsObjType = 0
+            if ($null -ne $item["FSObjType"] -and $item["FSObjType"].ToString() -ne "") {
+                $fsObjType = [int]$item["FSObjType"]
+            }
+
+            if ($leafName -eq "Forms" -and $fsObjType -eq 1) {
+                continue
+            }
+
+            $itemCount++
+        }
+
+        $listItemPosition = $currentPageItems.ListItemCollectionPosition
     }
-    catch {
-        $encodedPath = [System.Uri]::EscapeUriString($FolderSiteRelativeUrl)
-        $files = @(Get-PnPFolderItem -FolderSiteRelativeUrl $encodedPath -ItemType File -ErrorAction Stop)
-        $subFolders = @(Get-PnPFolderItem -FolderSiteRelativeUrl $encodedPath -ItemType Folder -ErrorAction Stop)
-    }
+    while ($null -ne $listItemPosition)
 
-    foreach ($subFolder in $subFolders) {
-        $subFolderName = ""
-
-        if ($subFolder.PSObject.Properties.Name -contains "Name") {
-            $subFolderName = [string]$subFolder.Name
-        }
-        elseif ($subFolder.PSObject.Properties.Name -contains "ServerRelativeUrl") {
-            $subFolderName = [System.IO.Path]::GetFileName([string]$subFolder.ServerRelativeUrl)
-        }
-        elseif ($subFolder.PSObject.Properties.Name -contains "FieldValues") {
-            $subFolderName = [string]$subFolder.FieldValues["FileLeafRef"]
-        }
-
-        if ($subFolderName -ne "Forms") {
-            $validSubFolderCount++
-        }
-    }
-
-    return ($files.Count + $validSubFolderCount)
+    return $itemCount
 }
 
 # ==========================================
@@ -444,7 +479,14 @@ function Get-LibraryFolderUrls {
         }
     }
 
-    $rootItemCount = Get-DirectChildItemCount -FolderSiteRelativeUrl $scopeRootSiteRelativeUrl
+    if ([string]::IsNullOrWhiteSpace($FolderName)) {
+        Write-Host "Querying all folders from library root: $scopeRootServerRelativeUrl"
+    }
+    else {
+        Write-Host "Querying scoped root folder '$FolderName': $scopeRootServerRelativeUrl"
+    }
+
+    $rootItemCount = Get-DirectChildItemCount -ListName $LibraryName -FolderServerRelativeUrl $scopeRootServerRelativeUrl
     [void]$folderRows.Add([PSCustomObject]@{
         TargetFolderUrl = $SiteUrl.TrimEnd('/') + $scopeRootServerRelativeUrl
         ItemsCount = [int]$rootItemCount
