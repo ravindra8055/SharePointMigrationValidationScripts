@@ -282,6 +282,98 @@ function Build-DateFilterCAML {
 }
 
 # ==========================================
+# Function: Build Paged ID Scan CAML
+# ==========================================
+function Build-PagedIdScanCAML {
+    [CmdletBinding()]
+    param()
+
+    $camlQuery = @"
+<View Scope="RecursiveAll">
+    <ViewFields>
+        <FieldRef Name="ID" />
+        <FieldRef Name="Modified" />
+    </ViewFields>
+    <Query>
+        <OrderBy Override="TRUE">
+            <FieldRef Name="ID" Ascending="TRUE" />
+        </OrderBy>
+    </Query>
+    <RowLimit Paged="TRUE">$($script:QueryPageSize)</RowLimit>
+</View>
+"@
+
+    return $camlQuery
+}
+
+# ==========================================
+# Function: Get Matching Item IDs by Pagination
+# ==========================================
+function Get-MatchingItemIdsByPagination {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ListName,
+
+        [Parameter(Mandatory = $true)]
+        [datetime]$DateThreshold,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DateCondition
+    )
+
+    $matchingItemIds = New-Object System.Collections.ArrayList
+    $scannedItemCount = 0
+    $pagedQueryXml = Build-PagedIdScanCAML
+    $connection = Get-PnPConnection -ErrorAction Stop
+    $clientContext = $connection.Context
+    $clientList = $clientContext.Web.Lists.GetByTitle($ListName)
+    $listItemPosition = $null
+    $currentPageItems = $null
+
+    do {
+        $camlQuery = New-Object Microsoft.SharePoint.Client.CamlQuery
+        $camlQuery.ViewXml = $pagedQueryXml
+        $camlQuery.ListItemCollectionPosition = $listItemPosition
+
+        $currentPageItems = $clientList.GetItems($camlQuery)
+        $clientContext.Load($currentPageItems)
+        $clientContext.ExecuteQuery()
+
+        foreach ($item in $currentPageItems) {
+            $scannedItemCount++
+
+            $modifiedValue = $item["Modified"]
+            if ($null -eq $modifiedValue) {
+                continue
+            }
+
+            $modifiedDate = [datetime]$modifiedValue
+            $isMatch = $false
+
+            if ($DateCondition -eq "Before" -and $modifiedDate -lt $DateThreshold) {
+                $isMatch = $true
+            }
+            elseif ($DateCondition -eq "After" -and $modifiedDate -gt $DateThreshold) {
+                $isMatch = $true
+            }
+
+            if ($isMatch) {
+                [void]$matchingItemIds.Add([int]$item["ID"])
+            }
+        }
+
+        $listItemPosition = $currentPageItems.ListItemCollectionPosition
+    }
+    while ($null -ne $listItemPosition)
+
+    return [PSCustomObject]@{
+        ItemIds          = @($matchingItemIds)
+        ScannedItemCount = $scannedItemCount
+    }
+}
+
+# ==========================================
 # Function: Recycle List Items by Date
 # ==========================================
 function Invoke-RecycleListItemsByDate {
@@ -306,6 +398,9 @@ function Invoke-RecycleListItemsByDate {
     $rowResult = $null
     $itemsRecycledCount = 0
     $isModifiedIndexed = $false
+    $matchedItemIds = @()
+    $scannedItemCount = 0
+    $retrievalMode = "IndexedDateQuery"
 
     try {
         Get-PnPConnectionForSite -SiteUrl $SiteUrl
@@ -315,18 +410,37 @@ function Invoke-RecycleListItemsByDate {
             throw "List '$ListName' not found"
         }
 
-        $isModifiedIndexed = Get-ModifiedFieldIndexState -ListName $ListName
-        if (-not $isModifiedIndexed) {
-            throw "The 'Modified' column is not indexed in list '$ListName'. SharePoint Online blocks date queries on large lists when the filtered column is not indexed. Index the 'Modified' column and run the script again."
+        try {
+            $isModifiedIndexed = Get-ModifiedFieldIndexState -ListName $ListName
+        }
+        catch {
+            Write-Warning "Could not determine whether 'Modified' is indexed for '$ListName'. Falling back to paged ID scan. $_"
+            $isModifiedIndexed = $false
         }
 
-        Write-Verbose "Building CAML query for date filtering..."
-        $camlQuery = Build-DateFilterCAML -DateThreshold $DateThreshold -DateCondition $DateCondition
+        if ($isModifiedIndexed) {
+            Write-Verbose "Building CAML query for date filtering..."
+            $camlQuery = Build-DateFilterCAML -DateThreshold $DateThreshold -DateCondition $DateCondition
 
-        Write-Verbose "Retrieving filtered items from list: $ListName"
-        $items = @(Get-PnPListItem -List $ListName -Query $camlQuery -PageSize $script:QueryPageSize -ErrorAction Stop)
+            Write-Verbose "Retrieving filtered items from list: $ListName"
+            $items = @(Get-PnPListItem -List $ListName -Query $camlQuery -PageSize $script:QueryPageSize -ErrorAction Stop)
 
-        if ($null -eq $items -or $items.Count -eq 0) {
+            foreach ($item in $items) {
+                $matchedItemIds += [int]$item.Id
+            }
+
+            $scannedItemCount = $matchedItemIds.Count
+            $retrievalMode = "IndexedDateQuery"
+        }
+        else {
+            Write-Warning "The 'Modified' column is not indexed in list '$ListName'. Using threshold-safe paged scan by ID and filtering dates client-side per page."
+            $scanResult = Get-MatchingItemIdsByPagination -ListName $ListName -DateThreshold $DateThreshold -DateCondition $DateCondition
+            $matchedItemIds = @($scanResult.ItemIds)
+            $scannedItemCount = $scanResult.ScannedItemCount
+            $retrievalMode = "PagedIdScan"
+        }
+
+        if ($matchedItemIds.Count -eq 0) {
             $rowResult = [PSCustomObject]@{
                 RowNumber            = $RowIndex
                 SiteUrl              = $SiteUrl
@@ -336,22 +450,22 @@ function Invoke-RecycleListItemsByDate {
                 Status               = "Completed"
                 IsSuccessful         = $true
                 ItemsRecycled        = 0
-                Message              = "No items matched the date criteria"
+                Message              = "No items matched the date criteria. RetrievalMode=$retrievalMode; ScannedItems=$scannedItemCount"
                 Timestamp            = (Get-Date).ToString("s")
             }
             return $rowResult
         }
 
-        $itemCount = if ($items -is [array]) { $items.Count } else { 1 }
-        Write-Host "Found $itemCount items to recycle from '$ListName'"
+        $itemCount = $matchedItemIds.Count
+        Write-Host "Found $itemCount items to recycle from '$ListName' using $retrievalMode"
 
-        foreach ($item in $items) {
+        foreach ($itemId in $matchedItemIds) {
             try {
-                Remove-PnPListItem -List $ListName -Identity $item.Id -Force -ErrorAction Stop
+                Remove-PnPListItem -List $ListName -Identity $itemId -Force -ErrorAction Stop
                 $itemsRecycledCount++
             }
             catch {
-                Write-Warning "Failed to recycle item $($item.Id) from '$ListName': $_"
+                Write-Warning "Failed to recycle item $itemId from '$ListName': $_"
             }
         }
 
@@ -364,7 +478,7 @@ function Invoke-RecycleListItemsByDate {
             Status               = "Completed"
             IsSuccessful         = $true
             ItemsRecycled        = $itemsRecycledCount
-            Message              = "Successfully recycled $itemsRecycledCount item(s)"
+            Message              = "Successfully recycled $itemsRecycledCount item(s). RetrievalMode=$retrievalMode; ScannedItems=$scannedItemCount"
             Timestamp            = (Get-Date).ToString("s")
         }
 
