@@ -8,8 +8,7 @@
     all nested folders from each library using PnP PowerShell.
 
     Output is generated in two files:
-    1) FolderPairs_*.csv with SourceFolderUrl and TargetFolderUrl columns.
-       SourceFolderUrl is left blank so it can be filled later for migration mapping.
+    1) FolderPairs_*.csv with TargetFolderUrl and ItemsCount columns.
     2) Results_*.csv with per-row processing status.
 
     A Summary_*.json file is also generated.
@@ -196,6 +195,33 @@ function Test-CsvRow {
 }
 
 # ==========================================
+# Function: Get Direct Child Item Count
+# ==========================================
+function Get-DirectChildItemCount {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FolderSiteRelativeUrl
+    )
+
+    $files = @()
+    $subFolders = @()
+
+    try {
+        $files = @(Get-PnPFolderItem -FolderSiteRelativeUrl $FolderSiteRelativeUrl -ItemType File -ErrorAction Stop)
+        $subFolders = @(Get-PnPFolderItem -FolderSiteRelativeUrl $FolderSiteRelativeUrl -ItemType Folder -ErrorAction Stop)
+    }
+    catch {
+        $encodedPath = [System.Uri]::EscapeUriString($FolderSiteRelativeUrl)
+        $files = @(Get-PnPFolderItem -FolderSiteRelativeUrl $encodedPath -ItemType File -ErrorAction Stop)
+        $subFolders = @(Get-PnPFolderItem -FolderSiteRelativeUrl $encodedPath -ItemType Folder -ErrorAction Stop)
+    }
+
+    $validSubFolders = @($subFolders | Where-Object { $_.Name -ne "Forms" })
+    return ($files.Count + $validSubFolders.Count)
+}
+
+# ==========================================
 # Function: Get Library Folder URLs
 # ==========================================
 function Get-LibraryFolderUrls {
@@ -210,7 +236,10 @@ function Get-LibraryFolderUrls {
 
     $list = $null
     $rootServerRelativeUrl = ""
-    $folderUrls = New-Object System.Collections.ArrayList
+    $folderRows = New-Object System.Collections.ArrayList
+    $web = $null
+    $rootSiteRelativeUrl = ""
+    $rootItemCount = 0
 
     try {
         $list = Get-PnPList -Identity $LibraryName -Includes RootFolder -ErrorAction Stop
@@ -223,14 +252,36 @@ function Get-LibraryFolderUrls {
         throw "Unable to retrieve root folder for library '$LibraryName'."
     }
 
+    $web = Get-PnPWeb -Includes ServerRelativeUrl -ErrorAction Stop
     $rootServerRelativeUrl = [string]$list.RootFolder.ServerRelativeUrl
-    [void]$folderUrls.Add($rootServerRelativeUrl)
+
+    $webServerRelativeUrl = [string]$web.ServerRelativeUrl
+    if ($webServerRelativeUrl -eq "/") {
+        $rootSiteRelativeUrl = $rootServerRelativeUrl.TrimStart('/')
+    }
+    elseif ($rootServerRelativeUrl.StartsWith($webServerRelativeUrl + "/", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $rootSiteRelativeUrl = $rootServerRelativeUrl.Substring($webServerRelativeUrl.Length + 1)
+    }
+    elseif ($rootServerRelativeUrl.Equals($webServerRelativeUrl, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $rootSiteRelativeUrl = ""
+    }
+    else {
+        $rootSiteRelativeUrl = $rootServerRelativeUrl.TrimStart('/')
+    }
+
+    $rootItemCount = Get-DirectChildItemCount -FolderSiteRelativeUrl $rootSiteRelativeUrl
+    [void]$folderRows.Add([PSCustomObject]@{
+        TargetFolderUrl = $SiteUrl.TrimEnd('/') + $rootServerRelativeUrl
+        ItemsCount = [int]$rootItemCount
+    })
 
     $camlQuery = @"
 <View Scope='RecursiveAll'>
     <ViewFields>
         <FieldRef Name='FileRef' />
         <FieldRef Name='FileLeafRef' />
+        <FieldRef Name='ItemChildCount' />
+        <FieldRef Name='FolderChildCount' />
     </ViewFields>
     <Query>
         <Where>
@@ -265,10 +316,23 @@ function Get-LibraryFolderUrls {
             continue
         }
 
-        [void]$folderUrls.Add($fileRef)
+        $itemChildCount = 0
+        if ($null -ne $item["ItemChildCount"] -and $item["ItemChildCount"].ToString() -ne "") {
+            $itemChildCount = [int]$item["ItemChildCount"]
+        }
+
+        $folderChildCount = 0
+        if ($null -ne $item["FolderChildCount"] -and $item["FolderChildCount"].ToString() -ne "") {
+            $folderChildCount = [int]$item["FolderChildCount"]
+        }
+
+        [void]$folderRows.Add([PSCustomObject]@{
+            TargetFolderUrl = $SiteUrl.TrimEnd('/') + $fileRef
+            ItemsCount = ($itemChildCount + $folderChildCount)
+        })
     }
 
-    return @($folderUrls | Sort-Object -Unique)
+    return @($folderRows | Sort-Object TargetFolderUrl -Unique)
 }
 
 # ==========================================
@@ -288,19 +352,18 @@ function Invoke-GenerateFolderPairsForRow {
     )
 
     $rowResult = $null
-    $folderUrls = @()
+    $folderRows = @()
     $folderCount = 0
 
     try {
         Get-PnPConnectionForSite -SiteUrl $SiteUrl
-        $folderUrls = @(Get-LibraryFolderUrls -SiteUrl $SiteUrl -LibraryName $LibraryName)
-        $folderCount = $folderUrls.Count
+        $folderRows = @(Get-LibraryFolderUrls -SiteUrl $SiteUrl -LibraryName $LibraryName)
+        $folderCount = $folderRows.Count
 
-        foreach ($folderUrl in $folderUrls) {
-            $targetFolderUrl = $SiteUrl.TrimEnd('/') + $folderUrl
+        foreach ($folderRow in $folderRows) {
             $script:FolderPairs += [PSCustomObject]@{
-                SourceFolderUrl = ""
-                TargetFolderUrl = $targetFolderUrl
+            TargetFolderUrl = $folderRow.TargetFolderUrl
+            ItemsCount = [int]$folderRow.ItemsCount
                 SiteUrl = $SiteUrl
                 LibraryName = $LibraryName
                 Timestamp = (Get-Date).ToString("s")
@@ -413,7 +476,7 @@ try {
     $summaryFile = Join-Path $OutputFolder "Summary_$(Get-Date -Format 'yyyyMMdd-HHmmss').json"
 
     Write-Host "Exporting generated folder pairs to CSV..."
-    $script:FolderPairs | Select-Object SourceFolderUrl, TargetFolderUrl | Export-Csv -Path $folderPairsFile -NoTypeInformation -Encoding UTF8 -Force
+    $script:FolderPairs | Select-Object TargetFolderUrl, ItemsCount | Export-Csv -Path $folderPairsFile -NoTypeInformation -Encoding UTF8 -Force
 
     Write-Host "Exporting row results to CSV..."
     $script:Results | Export-Csv -Path $resultFile -NoTypeInformation -Encoding UTF8 -Force
