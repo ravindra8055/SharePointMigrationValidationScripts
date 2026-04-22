@@ -29,6 +29,14 @@
     Page size for list item retrieval.
     Default: 2000
 
+.PARAMETER MaxRetryCount
+    Maximum retries for throttled CSOM ExecuteQuery calls (HTTP 429/503).
+    Default: 8
+
+.PARAMETER RetryBaseDelaySeconds
+    Base backoff delay in seconds for throttled requests.
+    Default: 2
+
 .PARAMETER OutputFolder
     Folder path for output files.
     Default: ./GenerateFolderPairsLog-{timestamp}
@@ -57,6 +65,10 @@ param(
 
     [int]$QueryPageSize = 2000,
 
+    [int]$MaxRetryCount = 8,
+
+    [int]$RetryBaseDelaySeconds = 2,
+
     [string]$OutputFolder = "./GenerateFolderPairsLog-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
 )
 
@@ -81,6 +93,14 @@ if (-not (Test-Path $CsvInputPath)) {
 
 if ($QueryPageSize -le 0) {
     throw "QueryPageSize must be greater than 0."
+}
+
+if ($MaxRetryCount -lt 0) {
+    throw "MaxRetryCount must be 0 or greater."
+}
+
+if ($RetryBaseDelaySeconds -le 0) {
+    throw "RetryBaseDelaySeconds must be greater than 0."
 }
 
 if (-not (Test-Path $OutputFolder)) {
@@ -159,6 +179,58 @@ function Disconnect-PnPIfConnected {
     catch {
         # Intentionally suppress disconnect errors when no active connection exists.
     }
+}
+
+# ==========================================
+# Function: Execute CSOM Query with Retry
+# ==========================================
+function Invoke-CSOMExecuteQueryWithRetry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$ClientContext,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OperationName
+    )
+
+    $lastException = $null
+
+    for ($attempt = 0; $attempt -le $MaxRetryCount; $attempt++) {
+        try {
+            $ClientContext.ExecuteQuery()
+            return
+        }
+        catch {
+            $lastException = $_.Exception
+
+            $message = ""
+            if ($null -ne $lastException -and $null -ne $lastException.Message) {
+                $message = [string]$lastException.Message
+            }
+
+            $isThrottled = ($message -like "*429*" -or $message -like "*Too Many Requests*" -or $message -like "*503*" -or $message -like "*throttl*")
+
+            if (-not $isThrottled) {
+                throw
+            }
+
+            if ($attempt -ge $MaxRetryCount) {
+                throw "SharePoint throttling persisted after $($MaxRetryCount + 1) attempt(s) for operation '$OperationName'. Last error: $message"
+            }
+
+            $waitSecondsDouble = [Math]::Pow(2, $attempt) * $RetryBaseDelaySeconds
+            $waitSeconds = [int][Math]::Ceiling([Math]::Min(60, $waitSecondsDouble))
+            Write-Warning "SharePoint throttling during '$OperationName' (attempt $($attempt + 1)/$($MaxRetryCount + 1)). Waiting $waitSeconds second(s) before retry."
+            Start-Sleep -Seconds $waitSeconds
+        }
+    }
+
+    if ($null -ne $lastException) {
+        throw $lastException
+    }
+
+    throw "ExecuteQuery retry loop ended unexpectedly for operation '$OperationName'."
 }
 
 # ==========================================
@@ -311,7 +383,7 @@ function Get-LibraryFolderUrls {
 
         $currentPageItems = $clientList.GetItems($camlQuery)
         $clientContext.Load($currentPageItems)
-        $clientContext.ExecuteQuery()
+        Invoke-CSOMExecuteQueryWithRetry -ClientContext $clientContext -OperationName "Paged folder scan: $LibraryName"
 
         foreach ($item in $currentPageItems) {
             $scannedItemCount++
@@ -556,3 +628,4 @@ finally {
     Disconnect-PnPIfConnected
     Write-Host "Script execution completed." -ForegroundColor Cyan
 }
+#\.Generate-FolderPairs-CSV.ps1 -CsvInputPath ".\LibraryFolders-Template.csv" -ClientId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" -TargetUsername "admin@tenant.onmicrosoft.com" -TargetPassword "Password123!" -MaxRetryCount 12 -RetryBaseDelaySeconds 4 -QueryPageSize 500
