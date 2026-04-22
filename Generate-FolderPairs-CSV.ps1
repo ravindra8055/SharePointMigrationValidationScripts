@@ -282,6 +282,7 @@ function Get-DirectChildItemCount {
 
     $files = @()
     $subFolders = @()
+    $validSubFolderCount = 0
 
     try {
         $files = @(Get-PnPFolderItem -FolderSiteRelativeUrl $FolderSiteRelativeUrl -ItemType File -ErrorAction Stop)
@@ -293,8 +294,25 @@ function Get-DirectChildItemCount {
         $subFolders = @(Get-PnPFolderItem -FolderSiteRelativeUrl $encodedPath -ItemType Folder -ErrorAction Stop)
     }
 
-    $validSubFolders = @($subFolders | Where-Object { $_.Name -ne "Forms" })
-    return ($files.Count + $validSubFolders.Count)
+    foreach ($subFolder in $subFolders) {
+        $subFolderName = ""
+
+        if ($subFolder.PSObject.Properties.Name -contains "Name") {
+            $subFolderName = [string]$subFolder.Name
+        }
+        elseif ($subFolder.PSObject.Properties.Name -contains "ServerRelativeUrl") {
+            $subFolderName = [System.IO.Path]::GetFileName([string]$subFolder.ServerRelativeUrl)
+        }
+        elseif ($subFolder.PSObject.Properties.Name -contains "FieldValues") {
+            $subFolderName = [string]$subFolder.FieldValues["FileLeafRef"]
+        }
+
+        if ($subFolderName -ne "Forms") {
+            $validSubFolderCount++
+        }
+    }
+
+    return ($files.Count + $validSubFolderCount)
 }
 
 # ==========================================
@@ -326,8 +344,10 @@ function Get-LibraryFolderUrls {
     $scannedItemCount = 0
     $scopeRootServerRelativeUrl = ""
     $scopeRootSiteRelativeUrl = ""
-    $rootSubFolders = @()
-    $matchingRootFolder = $null
+    $matchingRootFolderItem = $null
+    $rootFolderLookupCaml = ""
+    $escapedRootPath = ""
+    $escapedFolderName = ""
 
     try {
         $list = Get-PnPList -Identity $LibraryName -Includes RootFolder -ErrorAction Stop
@@ -361,21 +381,50 @@ function Get-LibraryFolderUrls {
     $scopeRootSiteRelativeUrl = $rootSiteRelativeUrl
 
     if (-not [string]::IsNullOrWhiteSpace($FolderName)) {
-        $rootSubFolders = @(Get-PnPFolderItem -FolderSiteRelativeUrl $rootSiteRelativeUrl -ItemType Folder -ErrorAction Stop)
-        $matchingRootFolder = $rootSubFolders | Where-Object {
-            $_.Name -and $_.Name.Equals($FolderName.Trim(), [System.StringComparison]::OrdinalIgnoreCase)
-        } | Select-Object -First 1
+        $escapedRootPath = [System.Security.SecurityElement]::Escape($rootServerRelativeUrl)
+        $escapedFolderName = [System.Security.SecurityElement]::Escape($FolderName.Trim())
 
-        if ($null -eq $matchingRootFolder) {
+        $rootFolderLookupCaml = @"
+<View Scope='RecursiveAll'>
+    <ViewFields>
+        <FieldRef Name='ID' />
+        <FieldRef Name='FileRef' />
+        <FieldRef Name='FileLeafRef' />
+    </ViewFields>
+    <Query>
+        <Where>
+            <And>
+                <Eq>
+                    <FieldRef Name='FSObjType' />
+                    <Value Type='Integer'>1</Value>
+                </Eq>
+                <And>
+                    <Eq>
+                        <FieldRef Name='FileDirRef' />
+                        <Value Type='Lookup'>$escapedRootPath</Value>
+                    </Eq>
+                    <Eq>
+                        <FieldRef Name='FileLeafRef' />
+                        <Value Type='Text'>$escapedFolderName</Value>
+                    </Eq>
+                </And>
+            </And>
+        </Where>
+        <OrderBy Override='TRUE'>
+            <FieldRef Name='ID' Ascending='TRUE' />
+        </OrderBy>
+    </Query>
+    <RowLimit Paged='TRUE'>1</RowLimit>
+</View>
+"@
+
+        $matchingRootFolderItem = @(Get-PnPListItem -List $LibraryName -Query $rootFolderLookupCaml -PageSize 1 -ErrorAction Stop) | Select-Object -First 1
+
+        if ($null -eq $matchingRootFolderItem) {
             throw "Root-level folder '$FolderName' was not found in library '$LibraryName'."
         }
 
-        if ($matchingRootFolder.PSObject.Properties.Name -contains "ServerRelativeUrl") {
-            $scopeRootServerRelativeUrl = [string]$matchingRootFolder.ServerRelativeUrl
-        }
-        elseif ($matchingRootFolder.PSObject.Properties.Name -contains "FieldValues") {
-            $scopeRootServerRelativeUrl = [string]$matchingRootFolder.FieldValues["FileRef"]
-        }
+        $scopeRootServerRelativeUrl = [string]$matchingRootFolderItem["FileRef"]
 
         if ([string]::IsNullOrWhiteSpace($scopeRootServerRelativeUrl)) {
             throw "Unable to resolve server relative URL for root folder '$FolderName' in library '$LibraryName'."
