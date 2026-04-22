@@ -240,6 +240,12 @@ function Get-LibraryFolderUrls {
     $web = $null
     $rootSiteRelativeUrl = ""
     $rootItemCount = 0
+    $connection = $null
+    $clientContext = $null
+    $clientList = $null
+    $listItemPosition = $null
+    $currentPageItems = $null
+    $scannedItemCount = 0
 
     try {
         $list = Get-PnPList -Identity $LibraryName -Includes RootFolder -ErrorAction Stop
@@ -275,62 +281,92 @@ function Get-LibraryFolderUrls {
         ItemsCount = [int]$rootItemCount
     })
 
-    $camlQuery = @"
+    $pagedScanCaml = @"
 <View Scope='RecursiveAll'>
     <ViewFields>
+        <FieldRef Name='ID' />
         <FieldRef Name='FileRef' />
         <FieldRef Name='FileLeafRef' />
+        <FieldRef Name='FSObjType' />
         <FieldRef Name='ItemChildCount' />
         <FieldRef Name='FolderChildCount' />
     </ViewFields>
     <Query>
-        <Where>
-            <Eq>
-                <FieldRef Name='FSObjType' />
-                <Value Type='Integer'>1</Value>
-            </Eq>
-        </Where>
         <OrderBy Override='TRUE'>
-            <FieldRef Name='FileRef' Ascending='TRUE' />
+            <FieldRef Name='ID' Ascending='TRUE' />
         </OrderBy>
     </Query>
     <RowLimit Paged='TRUE'>$($QueryPageSize)</RowLimit>
 </View>
 "@
 
-    $folderItems = @(Get-PnPListItem -List $LibraryName -Query $camlQuery -PageSize $QueryPageSize -ErrorAction Stop)
+    $connection = Get-PnPConnection -ErrorAction Stop
+    $clientContext = $connection.Context
+    $clientList = $clientContext.Web.Lists.GetByTitle($LibraryName)
 
-    foreach ($item in $folderItems) {
-        $fileRef = [string]$item["FileRef"]
-        $leafName = [string]$item["FileLeafRef"]
+    do {
+        $camlQuery = New-Object Microsoft.SharePoint.Client.CamlQuery
+        $camlQuery.ViewXml = $pagedScanCaml
+        $camlQuery.ListItemCollectionPosition = $listItemPosition
 
-        if ([string]::IsNullOrWhiteSpace($fileRef)) {
-            continue
+        $currentPageItems = $clientList.GetItems($camlQuery)
+        $clientContext.Load($currentPageItems)
+        $clientContext.ExecuteQuery()
+
+        foreach ($item in $currentPageItems) {
+            $scannedItemCount++
+
+            $fileRef = [string]$item["FileRef"]
+            if ([string]::IsNullOrWhiteSpace($fileRef)) {
+                continue
+            }
+
+            $fsObjType = 0
+            if ($null -ne $item["FSObjType"] -and $item["FSObjType"].ToString() -ne "") {
+                $fsObjType = [int]$item["FSObjType"]
+            }
+
+            if ($fsObjType -ne 1) {
+                continue
+            }
+
+            if (
+                -not $fileRef.Equals($rootServerRelativeUrl, [System.StringComparison]::OrdinalIgnoreCase) -and
+                -not $fileRef.StartsWith($rootServerRelativeUrl + "/", [System.StringComparison]::OrdinalIgnoreCase)
+            ) {
+                continue
+            }
+
+            $leafName = [string]$item["FileLeafRef"]
+            if ($leafName -eq "Forms") {
+                continue
+            }
+
+            if ($fileRef.Equals($rootServerRelativeUrl, [System.StringComparison]::OrdinalIgnoreCase)) {
+                continue
+            }
+
+            $itemChildCount = 0
+            if ($null -ne $item["ItemChildCount"] -and $item["ItemChildCount"].ToString() -ne "") {
+                $itemChildCount = [int]$item["ItemChildCount"]
+            }
+
+            $folderChildCount = 0
+            if ($null -ne $item["FolderChildCount"] -and $item["FolderChildCount"].ToString() -ne "") {
+                $folderChildCount = [int]$item["FolderChildCount"]
+            }
+
+            [void]$folderRows.Add([PSCustomObject]@{
+                TargetFolderUrl = $SiteUrl.TrimEnd('/') + $fileRef
+                ItemsCount = ($itemChildCount + $folderChildCount)
+            })
         }
 
-        if ($leafName -eq "Forms") {
-            continue
-        }
-
-        if ($fileRef.Equals($rootServerRelativeUrl, [System.StringComparison]::OrdinalIgnoreCase)) {
-            continue
-        }
-
-        $itemChildCount = 0
-        if ($null -ne $item["ItemChildCount"] -and $item["ItemChildCount"].ToString() -ne "") {
-            $itemChildCount = [int]$item["ItemChildCount"]
-        }
-
-        $folderChildCount = 0
-        if ($null -ne $item["FolderChildCount"] -and $item["FolderChildCount"].ToString() -ne "") {
-            $folderChildCount = [int]$item["FolderChildCount"]
-        }
-
-        [void]$folderRows.Add([PSCustomObject]@{
-            TargetFolderUrl = $SiteUrl.TrimEnd('/') + $fileRef
-            ItemsCount = ($itemChildCount + $folderChildCount)
-        })
+        $listItemPosition = $currentPageItems.ListItemCollectionPosition
     }
+    while ($null -ne $listItemPosition)
+
+    Write-Verbose "Scanned $scannedItemCount list item(s) in '$LibraryName' using pagination."
 
     return @($folderRows | Sort-Object TargetFolderUrl -Unique)
 }
