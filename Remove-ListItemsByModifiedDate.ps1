@@ -111,6 +111,24 @@ function Get-PnPConnectionForSite {
 }
 
 # ==========================================
+# Function: Disconnect from SPO Site
+# ==========================================
+function Disconnect-PnPIfConnected {
+    [CmdletBinding()]
+    param()
+
+    try {
+        $existingConnection = Get-PnPConnection -ErrorAction SilentlyContinue
+        if ($null -ne $existingConnection) {
+            Disconnect-PnPOnline -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+        # Intentionally suppress disconnect errors when no active connection exists.
+    }
+}
+
+# ==========================================
 # Function: Validate CSV Columns
 # ==========================================
 function Test-CsvFormat {
@@ -161,7 +179,8 @@ function Test-CsvRow {
         $errors += "DateThreshold is empty"
     }
     else {
-        if (-not ([datetime]::TryParse($Row.DateThreshold, [ref]$null))) {
+        $parsedDate = [datetime]::MinValue
+        if (-not [datetime]::TryParse($Row.DateThreshold, [ref]$parsedDate)) {
             $errors += "DateThreshold is not a valid date: $($Row.DateThreshold)"
         }
     }
@@ -325,7 +344,7 @@ function Invoke-RecycleListItemsByDate {
         }
     }
     finally {
-        Disconnect-PnPOnline -ErrorAction SilentlyContinue
+        Disconnect-PnPIfConnected
     }
 
     return $rowResult
@@ -453,6 +472,6 @@ catch {
     exit 1
 }
 finally {
-    Disconnect-PnPOnline -ErrorAction SilentlyContinue
+    Disconnect-PnPIfConnected
     Write-Host "Script execution completed." -ForegroundColor Cyan
 }
