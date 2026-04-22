@@ -189,6 +189,44 @@ function Test-CsvRow {
 }
 
 # ==========================================
+# Function: Build CAML Query for Date Filtering
+# ==========================================
+function Build-DateFilterCAML {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [datetime]$DateThreshold,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DateCondition
+    )
+
+    $dateString = $DateThreshold.ToString("yyyy-MM-ddTHH:mm:ssZ")
+    
+    if ($DateCondition -eq "Before") {
+        $operator = "Lt"
+    }
+    else {
+        $operator = "Gt"
+    }
+
+    $camlQuery = @"
+<View>
+  <Query>
+    <Where>
+      <$operator>
+        <FieldRef Name="Modified" />
+        <Value Type="DateTime">$dateString</Value>
+      </$operator>
+    </Where>
+  </Query>
+</View>
+"@
+
+    return $camlQuery
+}
+
+# ==========================================
 # Function: Recycle List Items by Date
 # ==========================================
 function Invoke-RecycleListItemsByDate {
@@ -221,44 +259,13 @@ function Invoke-RecycleListItemsByDate {
             throw "List '$ListName' not found"
         }
 
-        Write-Verbose "Retrieving items from list: $ListName"
-        $items = Get-PnPListItem -List $ListName -PageSize 5000 -ErrorAction Stop
+        Write-Verbose "Building CAML query for date filtering..."
+        $camlQuery = Build-DateFilterCAML -DateThreshold $DateThreshold -DateCondition $DateCondition
 
-        if ($items.Count -eq 0) {
-            $rowResult = [PSCustomObject]@{
-                RowNumber            = $RowIndex
-                SiteUrl              = $SiteUrl
-                ListName             = $ListName
-                DateThreshold        = $DateThreshold.ToString("s")
-                DateCondition        = $DateCondition
-                Status               = "Skipped"
-                IsSuccessful         = $true
-                ItemsRecycled        = 0
-                Message              = "List is empty; no items to process"
-                Timestamp            = (Get-Date).ToString("s")
-            }
-            return $rowResult
-        }
+        Write-Verbose "Retrieving filtered items from list: $ListName"
+        $items = Get-PnPListItem -List $ListName -Query $camlQuery -PageSize 5000 -ErrorAction Stop
 
-        $itemsToRecycle = @()
-
-        foreach ($item in $items) {
-            $modifiedDate = [datetime]::Parse($item["Modified"])
-
-            $shouldRecycle = $false
-            if ($DateCondition -eq "Before" -and $modifiedDate -lt $DateThreshold) {
-                $shouldRecycle = $true
-            }
-            elseif ($DateCondition -eq "After" -and $modifiedDate -gt $DateThreshold) {
-                $shouldRecycle = $true
-            }
-
-            if ($shouldRecycle) {
-                $itemsToRecycle += $item
-            }
-        }
-
-        if ($itemsToRecycle.Count -eq 0) {
+        if ($null -eq $items -or $items.Count -eq 0) {
             $rowResult = [PSCustomObject]@{
                 RowNumber            = $RowIndex
                 SiteUrl              = $SiteUrl
@@ -274,9 +281,10 @@ function Invoke-RecycleListItemsByDate {
             return $rowResult
         }
 
-        Write-Host "Found $($itemsToRecycle.Count) items to recycle from '$ListName'"
+        $itemCount = if ($items -is [array]) { $items.Count } else { 1 }
+        Write-Host "Found $itemCount items to recycle from '$ListName'"
 
-        foreach ($item in $itemsToRecycle) {
+        foreach ($item in $items) {
             try {
                 Remove-PnPListItem -List $ListName -Identity $item.Id -Force -ErrorAction Stop
                 $itemsRecycledCount++
