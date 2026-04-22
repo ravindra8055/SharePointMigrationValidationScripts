@@ -68,6 +68,7 @@ $script:SuccessfulRows  = 0
 $script:FailedRows      = 0
 $script:Credential      = $null
 $script:ItemsRecycled   = 0
+$script:TotalRows       = 0
 
 if (-not (Test-Path $CsvInputPath)) {
     throw "CSV input file not found: $CsvInputPath"
@@ -342,10 +343,11 @@ function Invoke-MainFunction {
 
     Write-Host "Validating CSV format..."
     Test-CsvFormat -Rows $rows
+    $script:TotalRows = $rows.Count
 
     Write-Host "Processing $($rows.Count) row(s)..."
 
-    foreach ($rowIndex = 0; $rowIndex -lt $rows.Count; $rowIndex++) {
+    for ($rowIndex = 0; $rowIndex -lt $rows.Count; $rowIndex++) {
         $row = $rows[$rowIndex]
         $displayRowNumber = $rowIndex + 1
 
@@ -419,7 +421,7 @@ try {
 
     $summary = @{
         ExecutionTime      = "$($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s"
-        TotalRows          = $rows.Count
+        TotalRows          = $script:TotalRows
         ProcessedRows      = $script:ProcessedRows
         SuccessfulRows     = $script:SuccessfulRows
         FailedRows         = $script:FailedRows
