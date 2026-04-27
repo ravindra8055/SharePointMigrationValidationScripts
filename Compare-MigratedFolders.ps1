@@ -115,7 +115,7 @@ function Import-CSOMAssemblies {
             Add-Type -Path $runtimeDll -ErrorAction SilentlyContinue
             Add-Type -Path $clientDll -ErrorAction SilentlyContinue
             $loaded = $true
-            Write-Host "✓ CSOM assemblies loaded from $path"
+            Write-Host "[OK] CSOM assemblies loaded from $path"
             break
         }
     }
@@ -180,7 +180,7 @@ function Initialize-TargetConnection {
 
         Connect-PnPOnline -Url $TargetSiteUrl -Credentials $credential -ClientId $ClientId -ErrorAction Stop
         $script:TargetContext = Get-PnPConnection
-        Write-Host "✓ Connected to SharePoint Online: $TargetSiteUrl"
+        Write-Host "[OK] Connected to SharePoint Online: $TargetSiteUrl"
     }
     catch {
         throw "Failed to connect to SharePoint Online: $_"
@@ -268,6 +268,67 @@ function Get-SiteRelativePathFromUrl {
     }
 
     return $serverRelativePath.TrimStart('/')
+}
+
+function Test-IsListViewThresholdError {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$ErrorRecord
+    )
+
+    $message = ""
+    if ($null -ne $ErrorRecord.Exception -and -not [string]::IsNullOrWhiteSpace($ErrorRecord.Exception.Message)) {
+        $message = $ErrorRecord.Exception.Message
+    }
+
+    $lowerMessage = $message.ToLowerInvariant()
+    $serverTypeName = ""
+    if ($null -ne $ErrorRecord.Exception -and $null -ne $ErrorRecord.Exception.ServerErrorTypeName) {
+        $serverTypeName = [string]$ErrorRecord.Exception.ServerErrorTypeName
+    }
+
+    if ($lowerMessage -like "*list*view*threshold*" -or
+        $lowerMessage -like "*attempted operation is prohibited*" -or
+        $lowerMessage -like "*prohibited because it exceeds*") {
+        return $true
+    }
+
+    if ($serverTypeName -eq "Microsoft.SharePoint.SPQueryThrottledException") {
+        return $true
+    }
+
+    return $false
+}
+
+function Get-LibraryIdentifierFromServerRelativePath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServerRelativePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SiteUrl
+    )
+
+    $siteUri = New-Object System.Uri($SiteUrl)
+    $sitePath = $siteUri.AbsolutePath.TrimEnd('/')
+
+    $pathAfterSite = $ServerRelativePath.TrimStart('/')
+    if ((-not [string]::IsNullOrWhiteSpace($sitePath)) -and ($sitePath -ne '/') -and $ServerRelativePath.StartsWith($sitePath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $pathAfterSite = $ServerRelativePath.Substring($sitePath.Length).TrimStart('/')
+    }
+
+    if ([string]::IsNullOrWhiteSpace($pathAfterSite)) {
+        throw "Could not derive library path from folder URL: $ServerRelativePath"
+    }
+
+    $librarySegment = $pathAfterSite.Split('/')[0]
+    if ([string]::IsNullOrWhiteSpace($librarySegment)) {
+        throw "Could not derive library segment from folder URL: $ServerRelativePath"
+    }
+
+    return [System.Uri]::UnescapeDataString($librarySegment)
 }
 
 function Resolve-FolderPair {
@@ -426,21 +487,19 @@ function Get-TargetFolderItems {
             $subFolders = Get-PnPFolderItem -FolderSiteRelativeUrl $siteRelativePath -ItemType Folder -ErrorAction Stop
         }
         catch {
-            $errMsg = $_.Exception.Message
-            if ($errMsg -like "*list view threshold*" -or $errMsg -like "*prohibited because it exceeds*") {
-                # Folder exceeds list view threshold — fall back to paged retrieval
+            if (Test-IsListViewThresholdError -ErrorRecord $_) {
+                # Folder exceeds list view threshold - fall back to paged retrieval
                 return Get-TargetFolderItemsPaged -SiteRelativePath $siteRelativePath -FolderUrl $FolderUrl
             }
 
-            # Some tenants/sites require encoded folder paths — retry with encoding
+            # Some tenants/sites require encoded folder paths - retry with encoding
             $encodedSiteRelativePath = [System.Uri]::EscapeUriString($siteRelativePath)
             try {
                 $files = Get-PnPFolderItem -FolderSiteRelativeUrl $encodedSiteRelativePath -ItemType File -ErrorAction Stop
                 $subFolders = Get-PnPFolderItem -FolderSiteRelativeUrl $encodedSiteRelativePath -ItemType Folder -ErrorAction Stop
             }
             catch {
-                $errMsg2 = $_.Exception.Message
-                if ($errMsg2 -like "*list view threshold*" -or $errMsg2 -like "*prohibited because it exceeds*") {
+                if (Test-IsListViewThresholdError -ErrorRecord $_) {
                     return Get-TargetFolderItemsPaged -SiteRelativePath $encodedSiteRelativePath -FolderUrl $FolderUrl
                 }
                 throw
@@ -512,14 +571,33 @@ function Get-TargetFolderItemsPaged {
 
     $serverRelativePath = Get-ServerRelativePathFromUrl -Url $FolderUrl -SiteUrl $TargetSiteUrl
 
-    # Derive the library URL name — first path segment after the site base path
-    $siteUri = New-Object System.Uri($TargetSiteUrl)
-    $sitePath = $siteUri.AbsolutePath.TrimEnd('/')
-    $pathAfterSite = $serverRelativePath.Substring($sitePath.Length).TrimStart('/')
-    $libraryUrlName = $pathAfterSite.Split('/')[0]
+    $decodedServerRelativePath = [System.Uri]::UnescapeDataString($serverRelativePath)
+    $libraryUrlName = Get-LibraryIdentifierFromServerRelativePath -ServerRelativePath $decodedServerRelativePath -SiteUrl $TargetSiteUrl
 
-    # Get-PnPListItem with -FolderServerRelativeUrl and -PageSize bypasses the list view threshold
-    $allItems = Get-PnPListItem -List $libraryUrlName -FolderServerRelativeUrl $serverRelativePath -PageSize 500 -ErrorAction Stop
+    $allItems = $null
+    try {
+        # Get-PnPListItem with -FolderServerRelativeUrl and -PageSize bypasses the list view threshold in most cases.
+        $allItems = Get-PnPListItem -List $libraryUrlName -FolderServerRelativeUrl $decodedServerRelativePath -PageSize 500 -ErrorAction Stop
+    }
+    catch {
+        # Fallback to resolving the list object by root folder path and retrying by list ID.
+        $lists = Get-PnPList -Includes RootFolder -ErrorAction Stop
+        $matchingList = $null
+        $libraryServerRelativePath = "$((New-Object System.Uri($TargetSiteUrl)).AbsolutePath.TrimEnd('/'))/$libraryUrlName"
+
+        foreach ($candidateList in $lists) {
+            if ($candidateList.RootFolder.ServerRelativeUrl.Equals($libraryServerRelativePath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $matchingList = $candidateList
+                break
+            }
+        }
+
+        if ($null -eq $matchingList) {
+            throw
+        }
+
+        $allItems = Get-PnPListItem -List $matchingList.Id -FolderServerRelativeUrl $decodedServerRelativePath -PageSize 500 -ErrorAction Stop
+    }
 
     $result = @()
     foreach ($item in $allItems) {
@@ -694,7 +772,7 @@ function Export-MissingItemsToFile {
 
     try {
         $script:MissingItems | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8 -Force
-        Write-Host "✓ Exported $($script:MissingItems.Count) items to $outputFile"
+        Write-Host "[OK] Exported $($script:MissingItems.Count) items to $outputFile"
         $script:OutputFileCounter++
         $script:MissingItems = @()
     }
@@ -747,10 +825,10 @@ function Invoke-FolderComparison {
             $script:FailedFolders++
         }
 
-        Write-Host "Processed: $SourceUrl ($($result.DifferenceItems.Count) differences)"
+        Write-Host ("Processed: {0} ({1} differences)" -f $SourceUrl, $result.DifferenceItems.Count)
     }
     catch {
-        Write-Error "Error processing pair $SourceUrl <-> $TargetUrl : $_"
+        Write-Error ("Error processing pair {0} to {1} : {2}" -f $SourceUrl, $TargetUrl, $_)
         $script:FailedFolders++
     }
 }
@@ -795,7 +873,7 @@ function Invoke-Migration {
     # Process folder pairs using runspace pool for parallelization
     $startTime = Get-Date
     $processedCount = 0
-
+    $ThreadCount=0
     if ($ThreadCount -gt 1) {
         # Use runspace pool for multi-threaded execution
         $runspacePool = [runspacefactory]::CreateRunspacePool(1, $ThreadCount)
@@ -887,9 +965,9 @@ function Invoke-Migration {
 # ==========================================
 try {
     Invoke-Migration
-    Write-Host "`n✓ Migration comparison completed successfully" -ForegroundColor Green
+    Write-Host "`n[OK] Migration comparison completed successfully" -ForegroundColor Green
 }
 catch {
-    Write-Host "`n✗ Migration comparison failed: $_" -ForegroundColor Red
+    Write-Host "`n[FAIL] Migration comparison failed: $_" -ForegroundColor Red
     exit 1
 }
