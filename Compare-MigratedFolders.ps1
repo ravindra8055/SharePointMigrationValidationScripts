@@ -479,13 +479,7 @@ function Get-PnPRestCollectionItems {
 
         $allItems += $pageItems
 
-        if (-not [string]::IsNullOrWhiteSpace($nextLink) -and $nextLink.StartsWith('http', [System.StringComparison]::OrdinalIgnoreCase)) {
-            $nextUri = New-Object System.Uri($nextLink)
-            $nextUrl = $nextUri.PathAndQuery.TrimStart('/')
-        }
-        else {
-            $nextUrl = $nextLink
-        }
+        $nextUrl = $nextLink
     }
 
     return @($allItems)
@@ -500,11 +494,14 @@ function Get-TargetFolderItemsByRest {
 
     Write-Verbose "Get-TargetFolderItemsByRest: folderServerRelativePath=$FolderServerRelativePath"
 
-    $encodedFolderPath = [System.Uri]::EscapeDataString($FolderServerRelativePath)
-    $escapedFolderPath = $encodedFolderPath.Replace("'", "''")
+    $escapedFolderPath = $FolderServerRelativePath.Replace("'", "''")
+    $baseApiUrl = $TargetSiteUrl.TrimEnd('/')
 
-    $filesUrl = "_api/web/GetFolderByServerRelativePath(decodedurl='$escapedFolderPath')/Files?`$select=Name,TimeLastModified,ServerRelativeUrl&`$top=5000"
-    $foldersUrl = "_api/web/GetFolderByServerRelativePath(decodedurl='$escapedFolderPath')/Folders?`$select=Name,TimeLastModified,ServerRelativeUrl&`$top=5000"
+    $filesUrl = "$baseApiUrl/_api/web/GetFolderByServerRelativePath(decodedurl='$escapedFolderPath')/Files?`$select=Name,TimeLastModified,ServerRelativeUrl&`$top=5000"
+    $foldersUrl = "$baseApiUrl/_api/web/GetFolderByServerRelativePath(decodedurl='$escapedFolderPath')/Folders?`$select=Name,TimeLastModified,ServerRelativeUrl&`$top=5000"
+
+    Write-Verbose "Get-TargetFolderItemsByRest: filesUrl=$filesUrl"
+    Write-Verbose "Get-TargetFolderItemsByRest: foldersUrl=$foldersUrl"
 
     $files = @(Get-PnPRestCollectionItems -RequestUrl $filesUrl)
     $folders = @(Get-PnPRestCollectionItems -RequestUrl $foldersUrl)
