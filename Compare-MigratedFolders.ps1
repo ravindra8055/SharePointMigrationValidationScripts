@@ -429,7 +429,7 @@ function Get-TargetFolderItems {
         }
         catch {
             $errMsg = $_.Exception.Message
-            if ($errMsg -like "*list view threshold*" -or $errMsg -like "*prohibited because it exceeds*") {
+            if ($errMsg -like "*list view threshold*" -or $errMsg -like "*prohibited because it exceeds*" -or $errMsg -like "*attempted operation is prohibited*") {
                 # Folder exceeds list view threshold -- fall back to paged retrieval
                 return Get-TargetFolderItemsPaged -SiteRelativePath $siteRelativePath -FolderUrl $FolderUrl
             }
@@ -442,7 +442,7 @@ function Get-TargetFolderItems {
             }
             catch {
                 $errMsg2 = $_.Exception.Message
-                if ($errMsg2 -like "*list view threshold*" -or $errMsg2 -like "*prohibited because it exceeds*") {
+                if ($errMsg2 -like "*list view threshold*" -or $errMsg2 -like "*prohibited because it exceeds*" -or $errMsg2 -like "*attempted operation is prohibited*") {
                     return Get-TargetFolderItemsPaged -SiteRelativePath $encodedSiteRelativePath -FolderUrl $FolderUrl
                 }
                 throw
