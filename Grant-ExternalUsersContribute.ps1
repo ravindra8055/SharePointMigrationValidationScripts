@@ -181,7 +181,7 @@ function Invoke-CsomQueryWithRetry {
             $isThrottled = $lastErrorMessage -match "429" -or $lastErrorMessage -match "throttl"
 
             if ((-not $isThrottled) -or ($attempt -eq $script:RetryCount)) {
-                throw "CSOM query failed for '$OperationName' on attempt $attempt: $lastErrorMessage"
+                throw "CSOM query failed for '$OperationName' on attempt $($attempt): $lastErrorMessage"
             }
 
             $delaySeconds = $script:RetryDelaySeconds * [math]::Pow(2, ($attempt - 1))
@@ -213,7 +213,7 @@ function Invoke-PnPCommandWithRetry {
             $isThrottled = $lastErrorMessage -match "429" -or $lastErrorMessage -match "throttl"
 
             if ((-not $isThrottled) -or ($attempt -eq $script:RetryCount)) {
-                throw "Permission assignment failed on attempt $attempt: $lastErrorMessage"
+                throw "Permission assignment failed on attempt $($attempt): $lastErrorMessage"
             }
 
             $delaySeconds = $script:RetryDelaySeconds * [math]::Pow(2, ($attempt - 1))
