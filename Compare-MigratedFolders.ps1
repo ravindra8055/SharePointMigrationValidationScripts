@@ -665,6 +665,37 @@ function Get-TargetFolderItemsByRest {
     return @($result)
 }
 
+function Get-TargetFolderItemCount {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FolderServerRelativePath
+    )
+
+    Write-Verbose "Get-TargetFolderItemCount: folderServerRelativePath=$FolderServerRelativePath"
+
+    $escapedPath = $FolderServerRelativePath.Replace("'", "''")
+    $encodedPath = [System.Uri]::EscapeUriString($escapedPath)
+    $baseApiUrl = $TargetSiteUrl.TrimEnd('/')
+    $url = "$baseApiUrl/_api/web/GetFolderByServerRelativePath(decodedurl='$encodedPath')?`$select=ItemCount"
+
+    $rawResponse = Invoke-PnPSPRestMethod -Method Get -Url $url -ErrorAction Stop
+    $json = ConvertFrom-PnPRestResponse -Response $rawResponse
+
+    $itemCount = -1
+    if ($json.PSObject.Properties.Name -contains 'ItemCount') {
+        $itemCount = [int]$json.ItemCount
+    }
+    elseif ($json.PSObject.Properties.Name -contains 'd') {
+        if ($json.d.PSObject.Properties.Name -contains 'ItemCount') {
+            $itemCount = [int]$json.d.ItemCount
+        }
+    }
+
+    Write-Verbose "Get-TargetFolderItemCount: ItemCount=$itemCount"
+    return $itemCount
+}
+
 function Resolve-FolderPair {
     [CmdletBinding()]
     param(
@@ -1000,9 +1031,28 @@ function Get-TargetFolderItemsPaged {
             Write-Warning "Get-TargetFolderItemsPaged: RenderListData fallback failed for $FolderUrl. Error: $($_.Exception.Message). Retrying with REST folder enumeration."
         }
 
-        $restItems = @(Get-TargetFolderItemsByRest -FolderServerRelativePath $decodedServerRelativePath)
-        Write-Verbose "Get-TargetFolderItemsPaged: REST fallback returned $($restItems.Count) items"
-        return @($restItems)
+        try {
+            $restItems = @(Get-TargetFolderItemsByRest -FolderServerRelativePath $decodedServerRelativePath)
+            Write-Verbose "Get-TargetFolderItemsPaged: REST fallback returned $($restItems.Count) items"
+            if ($restItems.Count -gt 0) {
+                return @($restItems)
+            }
+            Write-Warning "Get-TargetFolderItemsPaged: REST fallback returned zero items for $FolderUrl. Falling back to item count comparison."
+        }
+        catch {
+            Write-Warning "Get-TargetFolderItemsPaged: REST fallback failed for $FolderUrl. Error: $($_.Exception.Message). Falling back to item count comparison."
+        }
+
+        # Last resort: fetch folder ItemCount property (single scalar, never throttled)
+        try {
+            $targetItemCount = Get-TargetFolderItemCount -FolderServerRelativePath $decodedServerRelativePath
+            Write-Warning "Get-TargetFolderItemsPaged: All enumeration methods exhausted for $FolderUrl. Returning count-only sentinel (ItemCount=$targetItemCount)."
+            return @(@{ _CountOnlySentinel = $true; TargetItemCount = $targetItemCount })
+        }
+        catch {
+            Write-Warning "Get-TargetFolderItemsPaged: Item count fallback also failed for $FolderUrl. Error: $($_.Exception.Message)"
+            return @()
+        }
     }
 }
 
@@ -1044,6 +1094,29 @@ function Compare-FolderPair {
     
     if ($null -eq $targetItems) {
         $targetItems = @()
+    }
+
+    # Count-only sentinel: all enumeration methods exhausted, compare by ItemCount only
+    if ($targetItems.Count -eq 1 -and $targetItems[0] -is [hashtable] -and $targetItems[0].ContainsKey('_CountOnlySentinel')) {
+        $targetItemCount = [int]$targetItems[0].TargetItemCount
+        Write-Warning "Compare-FolderPair: count-only comparison for '$InputFolderPath'. Source=$($sourceItems.Count) Target=$targetItemCount"
+        $countDiffItems = @()
+        if ($targetItemCount -ne $sourceItems.Count) {
+            $countDiffItems += @{
+                Name            = '(ItemCount)'
+                Type            = 'CountMismatch'
+                LastModified    = $null
+                SourceUrl       = $SourceFolderUrl
+                TargetUrl       = $TargetFolderUrl
+                InputFolderPath = $InputFolderPath
+                Status          = "CountMismatch: Source=$($sourceItems.Count) Target=$targetItemCount"
+            }
+        }
+        return @{
+            Status          = 'Success'
+            DifferenceItems = $countDiffItems
+            SourceItemCount = $sourceItems.Count
+        }
     }
 
     Write-Verbose "Compare-FolderPair: sourceItems=$($sourceItems.Count), targetItems=$($targetItems.Count), folder=$InputFolderPath"
