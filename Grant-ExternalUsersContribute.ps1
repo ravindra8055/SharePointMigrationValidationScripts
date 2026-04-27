@@ -81,6 +81,8 @@ $script:ProcessedRows = 0
 $script:SuccessfulRows = 0
 $script:FailedRows = 0
 $script:Credential = $null
+$script:RetryCount = 5
+$script:RetryDelaySeconds = 3
 
 if ([string]::IsNullOrWhiteSpace($TargetSiteUrl)) {
     throw "TargetSiteUrl cannot be empty."
@@ -157,6 +159,70 @@ function Test-InputParameters {
 # ==========================================
 # Function: Core domain functions
 # ==========================================
+function Invoke-CsomQueryWithRetry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$ClientContext,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OperationName
+    )
+
+    $lastErrorMessage = ""
+
+    for ($attempt = 1; $attempt -le $script:RetryCount; $attempt++) {
+        try {
+            $ClientContext.ExecuteQuery()
+            return
+        }
+        catch {
+            $lastErrorMessage = $_.Exception.Message
+            $isThrottled = $lastErrorMessage -match "429" -or $lastErrorMessage -match "throttl"
+
+            if ((-not $isThrottled) -or ($attempt -eq $script:RetryCount)) {
+                throw "CSOM query failed for '$OperationName' on attempt $attempt: $lastErrorMessage"
+            }
+
+            $delaySeconds = $script:RetryDelaySeconds * [math]::Pow(2, ($attempt - 1))
+            Write-Warning "Throttled during '$OperationName' (attempt $attempt/$($script:RetryCount)). Retrying in $delaySeconds seconds."
+            Start-Sleep -Seconds $delaySeconds
+        }
+    }
+}
+
+function Invoke-PnPCommandWithRetry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$GroupName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$RoleName
+    )
+
+    $lastErrorMessage = ""
+
+    for ($attempt = 1; $attempt -le $script:RetryCount; $attempt++) {
+        try {
+            Set-PnPGroupPermissions -Identity $GroupName -AddRole $RoleName -ErrorAction Stop
+            return
+        }
+        catch {
+            $lastErrorMessage = $_.Exception.Message
+            $isThrottled = $lastErrorMessage -match "429" -or $lastErrorMessage -match "throttl"
+
+            if ((-not $isThrottled) -or ($attempt -eq $script:RetryCount)) {
+                throw "Permission assignment failed on attempt $attempt: $lastErrorMessage"
+            }
+
+            $delaySeconds = $script:RetryDelaySeconds * [math]::Pow(2, ($attempt - 1))
+            Write-Warning "Throttled while assigning '$RoleName' to '$GroupName' (attempt $attempt/$($script:RetryCount)). Retrying in $delaySeconds seconds."
+            Start-Sleep -Seconds $delaySeconds
+        }
+    }
+}
+
 function Get-MatchingGroups {
     [CmdletBinding()]
     param()
@@ -173,39 +239,39 @@ function Get-MatchingGroups {
     return $matchingGroups
 }
 
-function Test-GroupHasRole {
+function Get-GroupRoleLookup {
     [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [object]$Group,
-
-        [Parameter(Mandatory = $true)]
-        [string]$RoleName
-    )
+    param()
 
     $ctx = Get-PnPContext
     $web = Get-PnPWeb -ErrorAction Stop
+    $groupRoleLookup = @{}
 
     $ctx.Load($web.RoleAssignments)
-    $ctx.ExecuteQuery()
+    Invoke-CsomQueryWithRetry -ClientContext $ctx -OperationName "Load role assignments"
 
     foreach ($roleAssignment in $web.RoleAssignments) {
         $ctx.Load($roleAssignment.Member)
         $ctx.Load($roleAssignment.RoleDefinitionBindings)
-        $ctx.ExecuteQuery()
+    }
 
-        if ($roleAssignment.Member.LoginName -eq $Group.LoginName) {
-            foreach ($roleDef in $roleAssignment.RoleDefinitionBindings) {
-                if ($roleDef.Name -eq $RoleName) {
-                    return $true
-                }
+    Invoke-CsomQueryWithRetry -ClientContext $ctx -OperationName "Load role assignment details"
+
+    foreach ($roleAssignment in $web.RoleAssignments) {
+        $memberLogin = $roleAssignment.Member.LoginName
+
+        if (-not $groupRoleLookup.ContainsKey($memberLogin)) {
+            $groupRoleLookup[$memberLogin] = @{}
+        }
+
+        foreach ($roleDef in $roleAssignment.RoleDefinitionBindings) {
+            if (-not $groupRoleLookup[$memberLogin].ContainsKey($roleDef.Name)) {
+                $groupRoleLookup[$memberLogin][$roleDef.Name] = $true
             }
-
-            return $false
         }
     }
 
-    return $false
+    return $groupRoleLookup
 }
 
 function Set-GroupSitePermission {
@@ -215,11 +281,20 @@ function Set-GroupSitePermission {
         [object]$Group,
 
         [Parameter(Mandatory = $true)]
+        [hashtable]$GroupRoleLookup,
+
+        [Parameter(Mandatory = $true)]
         [int]$RowNumber
     )
 
     try {
-        $hasRole = Test-GroupHasRole -Group $Group -RoleName $PermissionLevel
+        $hasRole = $false
+
+        if ($GroupRoleLookup.ContainsKey($Group.LoginName)) {
+            if ($GroupRoleLookup[$Group.LoginName].ContainsKey($PermissionLevel)) {
+                $hasRole = $true
+            }
+        }
 
         if ($hasRole) {
             return [PSCustomObject]@{
@@ -233,7 +308,12 @@ function Set-GroupSitePermission {
             }
         }
 
-        Set-PnPGroupPermissions -Identity $Group.Title -AddRole $PermissionLevel -ErrorAction Stop
+        Invoke-PnPCommandWithRetry -GroupName $Group.Title -RoleName $PermissionLevel
+
+        if (-not $GroupRoleLookup.ContainsKey($Group.LoginName)) {
+            $GroupRoleLookup[$Group.LoginName] = @{}
+        }
+        $GroupRoleLookup[$Group.LoginName][$PermissionLevel] = $true
 
         return [PSCustomObject]@{
             RowNumber = $RowNumber
@@ -271,6 +351,7 @@ function Invoke-GrantDalmoreExternalUsersContribute {
     Get-PnPConnectionForSite -SiteUrl $TargetSiteUrl
 
     $matchingGroups = Get-MatchingGroups
+    $groupRoleLookup = Get-GroupRoleLookup
 
     if ($matchingGroups.Count -eq 0) {
         $script:ProcessedRows = 1
@@ -291,7 +372,7 @@ function Invoke-GrantDalmoreExternalUsersContribute {
             $rowIndex++
             Write-Host "Processing group $rowIndex/$($matchingGroups.Count): $($group.Title)"
 
-            $result = Set-GroupSitePermission -Group $group -RowNumber $rowIndex
+            $result = Set-GroupSitePermission -Group $group -GroupRoleLookup $groupRoleLookup -RowNumber $rowIndex
             $script:Results += $result
 
             $script:ProcessedRows++
