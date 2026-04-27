@@ -169,11 +169,18 @@ function Initialize-TargetConnection {
 
     try {
         Write-Host "Connecting to SharePoint Online..."
+        Write-Verbose "Initialize-TargetConnection: TargetSiteUrl=$TargetSiteUrl, TargetUsername=$TargetUsername"
         $securePassword = ConvertTo-SecureString $TargetPassword -AsPlainText -Force
         $credential = New-Object System.Management.Automation.PSCredential($TargetUsername, $securePassword)
 
         Connect-PnPOnline -Url $TargetSiteUrl -Credentials $credential -ClientId $ClientId -ErrorAction Stop
         $script:TargetContext = Get-PnPConnection
+        if ($null -eq $script:TargetContext) {
+            Write-Warning "Initialize-TargetConnection: Get-PnPConnection returned null after connect."
+        }
+        else {
+            Write-Verbose "Initialize-TargetConnection: PnP connection established successfully."
+        }
         Write-Host "[OK] Connected to SharePoint Online: $TargetSiteUrl"
     }
     catch {
@@ -367,6 +374,8 @@ function Get-TargetFolderItemsByCaml {
         [string]$FolderServerRelativePath
     )
 
+        Write-Verbose "Get-TargetFolderItemsByCaml: listId=$ListId, folderServerRelativePath=$FolderServerRelativePath"
+
     $escapedFolderPath = [System.Security.SecurityElement]::Escape($FolderServerRelativePath)
 
     $query = @"
@@ -402,6 +411,8 @@ function Get-TargetFolderItemsByCaml {
             $result += @{ Name = $name; Type = "Folder"; LastModified = $modified }
         }
     }
+
+    Write-Verbose "Get-TargetFolderItemsByCaml: retrieved $($result.Count) items"
 
     return $result
 }
@@ -549,6 +560,16 @@ function Get-TargetFolderItems {
 
     try {
         $siteRelativePath = Get-SiteRelativePathFromUrl -Url $FolderUrl -SiteUrl $TargetSiteUrl
+        Write-Verbose "Get-TargetFolderItems: folderUrl=$FolderUrl"
+        Write-Verbose "Get-TargetFolderItems: siteRelativePath=$siteRelativePath"
+
+        $currentPnPConnection = Get-PnPConnection -ErrorAction SilentlyContinue
+        if ($null -eq $currentPnPConnection) {
+            Write-Warning "Get-TargetFolderItems: No active PnP connection detected before query."
+        }
+        else {
+            Write-Verbose "Get-TargetFolderItems: Active PnP connection detected."
+        }
 
         if ([string]::IsNullOrWhiteSpace($siteRelativePath)) {
             throw "Could not derive site-relative folder path from target URL: $FolderUrl"
@@ -558,25 +579,40 @@ function Get-TargetFolderItems {
         $subFolders = $null
 
         try {
+            Write-Verbose "Get-TargetFolderItems: querying target via Get-PnPFolderItem (siteRelativePath)"
             $files = Get-PnPFolderItem -FolderSiteRelativeUrl $siteRelativePath -ItemType File -ErrorAction Stop
             $subFolders = Get-PnPFolderItem -FolderSiteRelativeUrl $siteRelativePath -ItemType Folder -ErrorAction Stop
+            $fileCount = 0
+            $folderCount = 0
+            if ($null -ne $files) { $fileCount = $files.Count }
+            if ($null -ne $subFolders) { $folderCount = $subFolders.Count }
+            Write-Verbose "Get-TargetFolderItems: Get-PnPFolderItem returned files=$fileCount, folders=$folderCount"
         }
         catch {
             if (Test-IsListViewThresholdError -ErrorRecord $_) {
                 # Folder exceeds list view threshold - fall back to paged retrieval
+                Write-Warning "Get-TargetFolderItems: threshold detected for $FolderUrl. Switching to paged fallback."
                 return Get-TargetFolderItemsPaged -SiteRelativePath $siteRelativePath -FolderUrl $FolderUrl
             }
 
             # Some tenants/sites require encoded folder paths - retry with encoding
             $encodedSiteRelativePath = [System.Uri]::EscapeUriString($siteRelativePath)
+            Write-Verbose "Get-TargetFolderItems: retrying Get-PnPFolderItem with encoded path=$encodedSiteRelativePath"
             try {
                 $files = Get-PnPFolderItem -FolderSiteRelativeUrl $encodedSiteRelativePath -ItemType File -ErrorAction Stop
                 $subFolders = Get-PnPFolderItem -FolderSiteRelativeUrl $encodedSiteRelativePath -ItemType Folder -ErrorAction Stop
+                $encodedFileCount = 0
+                $encodedFolderCount = 0
+                if ($null -ne $files) { $encodedFileCount = $files.Count }
+                if ($null -ne $subFolders) { $encodedFolderCount = $subFolders.Count }
+                Write-Verbose "Get-TargetFolderItems: encoded Get-PnPFolderItem returned files=$encodedFileCount, folders=$encodedFolderCount"
             }
             catch {
                 if (Test-IsListViewThresholdError -ErrorRecord $_) {
+                    Write-Warning "Get-TargetFolderItems: threshold detected on encoded path for $FolderUrl. Switching to paged fallback."
                     return Get-TargetFolderItemsPaged -SiteRelativePath $encodedSiteRelativePath -FolderUrl $FolderUrl
                 }
+                Write-Warning "Get-TargetFolderItems: encoded path query failed for $FolderUrl. Error: $($_.Exception.Message)"
                 throw
             }
         }
@@ -621,6 +657,8 @@ function Get-TargetFolderItems {
             }
         }
 
+        Write-Verbose "Get-TargetFolderItems: normalized target item count=$($result.Count)"
+
         return $result
     }
     catch {
@@ -650,10 +688,16 @@ function Get-TargetFolderItemsPaged {
     $targetList = $null
     try {
         $targetList = Resolve-TargetListForFolder -FolderServerRelativePath $decodedServerRelativePath -SiteUrl $TargetSiteUrl
+        Write-Verbose "Get-TargetFolderItemsPaged: resolved target list id=$($targetList.Id), title=$($targetList.Title)"
 
         # First try Get-PnPFolderItem with explicit list scope for large libraries.
         $files = Get-PnPFolderItem -List $targetList.Id -FolderSiteRelativeUrl $SiteRelativePath -ItemType File -ErrorAction Stop
         $subFolders = Get-PnPFolderItem -List $targetList.Id -FolderSiteRelativeUrl $SiteRelativePath -ItemType Folder -ErrorAction Stop
+        $fileCount = 0
+        $folderCount = 0
+        if ($null -ne $files) { $fileCount = $files.Count }
+        if ($null -ne $subFolders) { $folderCount = $subFolders.Count }
+        Write-Verbose "Get-TargetFolderItemsPaged: list-scoped Get-PnPFolderItem returned files=$fileCount, folders=$folderCount"
 
         $result = @()
 
@@ -693,16 +737,21 @@ function Get-TargetFolderItemsPaged {
             }
         }
 
+        Write-Verbose "Get-TargetFolderItemsPaged: normalized target item count=$($result.Count)"
+
         return $result
     }
     catch {
-        Write-Verbose "Get-PnPFolderItem fallback failed for $FolderUrl. Retrying with CAML paging."
+        Write-Warning "Get-TargetFolderItemsPaged: list-scoped retrieval failed for $FolderUrl. Error: $($_.Exception.Message). Retrying with CAML paging."
 
         if ($null -eq $targetList) {
             $targetList = Resolve-TargetListForFolder -FolderServerRelativePath $decodedServerRelativePath -SiteUrl $TargetSiteUrl
+            Write-Verbose "Get-TargetFolderItemsPaged: resolved target list for CAML fallback id=$($targetList.Id), title=$($targetList.Title)"
         }
 
-        return Get-TargetFolderItemsByCaml -ListId $targetList.Id -FolderServerRelativePath $decodedServerRelativePath
+        $camlItems = Get-TargetFolderItemsByCaml -ListId $targetList.Id -FolderServerRelativePath $decodedServerRelativePath
+        Write-Verbose "Get-TargetFolderItemsPaged: CAML fallback returned $($camlItems.Count) items"
+        return $camlItems
     }
 }
 
@@ -744,6 +793,11 @@ function Compare-FolderPair {
     
     if ($null -eq $targetItems) {
         $targetItems = @()
+    }
+
+    Write-Verbose "Compare-FolderPair: sourceItems=$($sourceItems.Count), targetItems=$($targetItems.Count), folder=$InputFolderPath"
+    if (($sourceItems.Count -gt 0) -and ($targetItems.Count -eq 0)) {
+        Write-Warning "Compare-FolderPair: target returned zero items while source has $($sourceItems.Count) items for folder: $InputFolderPath"
     }
 
     # Create lookup table for faster comparison
