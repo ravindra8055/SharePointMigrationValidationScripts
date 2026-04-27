@@ -1096,9 +1096,19 @@ function Compare-FolderPair {
         $targetItems = @()
     }
 
-    # Count-only sentinel: all enumeration methods exhausted, compare by ItemCount only
-    if ($targetItems.Count -eq 1 -and $targetItems[0] -is [hashtable] -and $targetItems[0].ContainsKey('_CountOnlySentinel')) {
-        $targetItemCount = [int]$targetItems[0].TargetItemCount
+    # Count-only sentinel: all enumeration methods exhausted, compare by ItemCount only.
+    # PS 5.1 may unwrap the return array so $targetItems could be the bare hashtable OR
+    # an array whose first element is the hashtable — check both.
+    $sentinelItem = $null
+    if ($targetItems -is [hashtable] -and $targetItems.ContainsKey('_CountOnlySentinel')) {
+        $sentinelItem = $targetItems
+    }
+    elseif (($null -ne $targetItems) -and ($targetItems.Count -ge 1) -and ($targetItems[0] -is [hashtable]) -and $targetItems[0].ContainsKey('_CountOnlySentinel')) {
+        $sentinelItem = $targetItems[0]
+    }
+
+    if ($null -ne $sentinelItem) {
+        $targetItemCount = [int]$sentinelItem.TargetItemCount
         Write-Warning "Compare-FolderPair: count-only comparison for '$InputFolderPath'. Source=$($sourceItems.Count) Target=$targetItemCount"
         $countDiffItems = @()
         if ($targetItemCount -ne $sourceItems.Count) {
