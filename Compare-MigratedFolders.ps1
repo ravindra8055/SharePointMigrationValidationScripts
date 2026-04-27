@@ -431,6 +431,130 @@ function ConvertFrom-PnPRestResponse {
     return $Response
 }
 
+function Get-ObjectPropertyValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$InputObject,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$PropertyNames
+    )
+
+    foreach ($propertyName in $PropertyNames) {
+        $property = $InputObject.PSObject.Properties[$propertyName]
+        if ($null -ne $property) {
+            return $property.Value
+        }
+    }
+
+    return $null
+}
+
+function Convert-RenderListDataRowsToTargetItems {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Rows
+    )
+
+    $result = @()
+    foreach ($row in $Rows) {
+        $name = [string](Get-ObjectPropertyValue -InputObject $row -PropertyNames @('FileLeafRef', 'FileLeafRef.Name', 'FileName'))
+        $modified = Get-ObjectPropertyValue -InputObject $row -PropertyNames @('Modified', 'Modified.', 'TimeLastModified')
+        $fsObjTypeValue = Get-ObjectPropertyValue -InputObject $row -PropertyNames @('FSObjType', '.FSObjType')
+        $contentType = [string](Get-ObjectPropertyValue -InputObject $row -PropertyNames @('ContentType', 'ContentTypeId'))
+
+        if ([string]::IsNullOrWhiteSpace($name) -or $name -eq 'Forms') {
+            continue
+        }
+
+        $itemType = ''
+        if (($null -ne $fsObjTypeValue) -and ([string]$fsObjTypeValue -eq '1')) {
+            $itemType = 'Folder'
+        }
+        elseif (($null -ne $fsObjTypeValue) -and ([string]$fsObjTypeValue -eq '0')) {
+            $itemType = 'File'
+        }
+        elseif ($contentType -like '0x0120*') {
+            $itemType = 'Folder'
+        }
+        else {
+            $itemType = 'File'
+        }
+
+        $result += @{
+            Name = $name
+            Type = $itemType
+            LastModified = $modified
+        }
+    }
+
+    return @($result)
+}
+
+function Get-TargetFolderItemsByRenderListData {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ListServerRelativePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$FolderServerRelativePath
+    )
+
+    Write-Verbose "Get-TargetFolderItemsByRenderListData: listServerRelativePath=$ListServerRelativePath, folderServerRelativePath=$FolderServerRelativePath"
+
+    $baseApiUrl = $TargetSiteUrl.TrimEnd('/')
+    $encodedListPath = [System.Uri]::EscapeDataString($ListServerRelativePath)
+    $endpoint = "$baseApiUrl/_api/web/GetList(@listUrl)/RenderListDataAsStream?@listUrl='$encodedListPath'"
+    $rows = @()
+    $paging = $null
+
+    do {
+        $parameters = @{
+            RenderOptions = 2
+            FolderServerRelativeUrl = $FolderServerRelativePath
+            ViewXml = '<View Scope="Default"><RowLimit Paged="TRUE">500</RowLimit></View>'
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($paging)) {
+            $parameters.Paging = $paging
+        }
+
+        $bodyObject = @{ parameters = $parameters }
+        $body = $bodyObject | ConvertTo-Json -Depth 10
+
+        Write-Verbose "Get-TargetFolderItemsByRenderListData: requesting page with paging token present=$(-not [string]::IsNullOrWhiteSpace($paging))"
+        $response = Invoke-PnPSPRestMethod -Method Post -Url $endpoint -Content $body -ContentType 'application/json;odata=verbose' -ErrorAction Stop
+        $json = ConvertFrom-PnPRestResponse -Response $response
+
+        $pageRows = @()
+        if ($json.PSObject.Properties.Name -contains 'Row') {
+            $pageRows = @($json.Row)
+        }
+        elseif (($json.PSObject.Properties.Name -contains 'ListData') -and ($json.ListData.PSObject.Properties.Name -contains 'Row')) {
+            $pageRows = @($json.ListData.Row)
+        }
+
+        $rows += $pageRows
+        $paging = $null
+
+        if ($json.PSObject.Properties.Name -contains 'NextHref') {
+            $paging = [string]$json.NextHref
+        }
+        elseif (($json.PSObject.Properties.Name -contains 'ListData') -and ($json.ListData.PSObject.Properties.Name -contains 'NextHref')) {
+            $paging = [string]$json.ListData.NextHref
+        }
+    }
+    while (-not [string]::IsNullOrWhiteSpace($paging))
+
+    Write-Verbose "Get-TargetFolderItemsByRenderListData: raw rows returned=$($rows.Count)"
+    $result = Convert-RenderListDataRowsToTargetItems -Rows $rows
+    Write-Verbose "Get-TargetFolderItemsByRenderListData: normalized target item count=$($result.Count)"
+    return @($result)
+}
+
 function Get-PnPRestCollectionItems {
     [CmdletBinding()]
     param(
@@ -860,6 +984,20 @@ function Get-TargetFolderItemsPaged {
         }
         catch {
             Write-Warning "Get-TargetFolderItemsPaged: CAML fallback failed for $FolderUrl. Error: $($_.Exception.Message). Retrying with REST folder enumeration."
+        }
+
+        try {
+            $renderItems = @(Get-TargetFolderItemsByRenderListData -ListServerRelativePath $targetList.RootFolder.ServerRelativeUrl -FolderServerRelativePath $decodedServerRelativePath)
+            Write-Verbose "Get-TargetFolderItemsPaged: RenderListData fallback returned $($renderItems.Count) items"
+
+            if ($renderItems.Count -gt 0) {
+                return @($renderItems)
+            }
+
+            Write-Warning "Get-TargetFolderItemsPaged: RenderListData fallback returned zero items for $FolderUrl. Retrying with REST folder enumeration."
+        }
+        catch {
+            Write-Warning "Get-TargetFolderItemsPaged: RenderListData fallback failed for $FolderUrl. Error: $($_.Exception.Message). Retrying with REST folder enumeration."
         }
 
         $restItems = @(Get-TargetFolderItemsByRest -FolderServerRelativePath $decodedServerRelativePath)
