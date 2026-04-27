@@ -494,7 +494,8 @@ function Get-TargetFolderItemsByRest {
 
     Write-Verbose "Get-TargetFolderItemsByRest: folderServerRelativePath=$FolderServerRelativePath"
 
-    $escapedFolderPath = $FolderServerRelativePath.Replace("'", "''")
+    $encodedFolderPath = [System.Uri]::EscapeDataString($FolderServerRelativePath)
+    $escapedFolderPath = $encodedFolderPath.Replace("'", "''")
     $baseApiUrl = $TargetSiteUrl.TrimEnd('/')
 
     $filesUrl = "$baseApiUrl/_api/web/GetFolderByServerRelativePath(decodedurl='$escapedFolderPath')/Files?`$select=Name,TimeLastModified,ServerRelativeUrl&`$top=5000"
