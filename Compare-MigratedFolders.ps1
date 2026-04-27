@@ -417,6 +417,132 @@ function Get-TargetFolderItemsByCaml {
     return @($result)
 }
 
+function ConvertFrom-PnPRestResponse {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Response
+    )
+
+    if ($Response -is [string]) {
+        return ($Response | ConvertFrom-Json)
+    }
+
+    return $Response
+}
+
+function Get-PnPRestCollectionItems {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RequestUrl
+    )
+
+    $allItems = @()
+    $nextUrl = $RequestUrl
+
+    while (-not [string]::IsNullOrWhiteSpace($nextUrl)) {
+        Write-Verbose "Get-PnPRestCollectionItems: requesting $nextUrl"
+
+        $response = Invoke-PnPSPRestMethod -Method Get -Url $nextUrl -ErrorAction Stop
+        $json = ConvertFrom-PnPRestResponse -Response $response
+        $pageItems = @()
+        $nextLink = $null
+
+        if ($json.PSObject.Properties.Name -contains 'd') {
+            if ($json.d.PSObject.Properties.Name -contains 'results') {
+                $pageItems = @($json.d.results)
+            }
+            else {
+                $pageItems = @($json.d)
+            }
+
+            if ($json.d.PSObject.Properties.Name -contains '__next') {
+                $nextLink = [string]$json.d.__next
+            }
+        }
+        else {
+            if ($json.PSObject.Properties.Name -contains 'value') {
+                $pageItems = @($json.value)
+            }
+            else {
+                $pageItems = @($json)
+            }
+
+            if ($json.PSObject.Properties.Name -contains '@odata.nextLink') {
+                $nextLink = [string]$json.'@odata.nextLink'
+            }
+            elseif ($json.PSObject.Properties.Name -contains 'odata.nextLink') {
+                $nextLink = [string]$json.'odata.nextLink'
+            }
+        }
+
+        $allItems += $pageItems
+
+        if (-not [string]::IsNullOrWhiteSpace($nextLink) -and $nextLink.StartsWith('http', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $nextUri = New-Object System.Uri($nextLink)
+            $nextUrl = $nextUri.PathAndQuery.TrimStart('/')
+        }
+        else {
+            $nextUrl = $nextLink
+        }
+    }
+
+    return @($allItems)
+}
+
+function Get-TargetFolderItemsByRest {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FolderServerRelativePath
+    )
+
+    Write-Verbose "Get-TargetFolderItemsByRest: folderServerRelativePath=$FolderServerRelativePath"
+
+    $encodedFolderPath = [System.Uri]::EscapeDataString($FolderServerRelativePath)
+    $escapedFolderPath = $encodedFolderPath.Replace("'", "''")
+
+    $filesUrl = "_api/web/GetFolderByServerRelativePath(decodedurl='$escapedFolderPath')/Files?`$select=Name,TimeLastModified,ServerRelativeUrl&`$top=5000"
+    $foldersUrl = "_api/web/GetFolderByServerRelativePath(decodedurl='$escapedFolderPath')/Folders?`$select=Name,TimeLastModified,ServerRelativeUrl&`$top=5000"
+
+    $files = @(Get-PnPRestCollectionItems -RequestUrl $filesUrl)
+    $folders = @(Get-PnPRestCollectionItems -RequestUrl $foldersUrl)
+
+    Write-Verbose "Get-TargetFolderItemsByRest: files=$($files.Count), folders=$($folders.Count)"
+
+    $result = @()
+
+    foreach ($file in $files) {
+        $fileName = [string]$file.Name
+        if ([string]::IsNullOrWhiteSpace($fileName)) {
+            continue
+        }
+
+        $result += @{
+            Name = $fileName
+            Type = 'File'
+            LastModified = $file.TimeLastModified
+        }
+    }
+
+    foreach ($folder in $folders) {
+        $folderName = [string]$folder.Name
+        if ([string]::IsNullOrWhiteSpace($folderName) -or $folderName -eq 'Forms') {
+            continue
+        }
+
+        $result += @{
+            Name = $folderName
+            Type = 'Folder'
+            LastModified = $folder.TimeLastModified
+        }
+    }
+
+    Write-Verbose "Get-TargetFolderItemsByRest: normalized target item count=$(@($result).Count)"
+    return @($result)
+}
+
 function Resolve-FolderPair {
     [CmdletBinding()]
     param(
@@ -724,9 +850,23 @@ function Get-TargetFolderItemsPaged {
             Write-Verbose "Get-TargetFolderItemsPaged: resolved target list for CAML fallback id=$($targetList.Id), title=$($targetList.Title)"
         }
 
-        $camlItems = @(Get-TargetFolderItemsByCaml -ListId $targetList.Id -FolderServerRelativePath $decodedServerRelativePath)
-        Write-Verbose "Get-TargetFolderItemsPaged: CAML fallback returned $($camlItems.Count) items"
-        return @($camlItems)
+        try {
+            $camlItems = @(Get-TargetFolderItemsByCaml -ListId $targetList.Id -FolderServerRelativePath $decodedServerRelativePath)
+            Write-Verbose "Get-TargetFolderItemsPaged: CAML fallback returned $($camlItems.Count) items"
+
+            if ($camlItems.Count -gt 0) {
+                return @($camlItems)
+            }
+
+            Write-Warning "Get-TargetFolderItemsPaged: CAML fallback returned zero items for $FolderUrl. Retrying with REST folder enumeration."
+        }
+        catch {
+            Write-Warning "Get-TargetFolderItemsPaged: CAML fallback failed for $FolderUrl. Error: $($_.Exception.Message). Retrying with REST folder enumeration."
+        }
+
+        $restItems = @(Get-TargetFolderItemsByRest -FolderServerRelativePath $decodedServerRelativePath)
+        Write-Verbose "Get-TargetFolderItemsPaged: REST fallback returned $($restItems.Count) items"
+        return @($restItems)
     }
 }
 
