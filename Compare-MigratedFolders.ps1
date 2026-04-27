@@ -526,7 +526,8 @@ function Get-TargetFolderItemsByRenderListData {
         $body = $bodyObject | ConvertTo-Json -Depth 10
 
         Write-Verbose "Get-TargetFolderItemsByRenderListData: requesting page with paging token present=$(-not [string]::IsNullOrWhiteSpace($paging))"
-        $json = Invoke-SPORestPost -Url $endpoint -Body $body
+        $rawResponse = Invoke-PnPSPRestMethod -Method Post -Url $endpoint -Content $body -ContentType 'application/json;odata=nometadata' -ErrorAction Stop
+        $json = ConvertFrom-PnPRestResponse -Response $rawResponse
 
         $pageRows = @()
         if ($json.PSObject.Properties.Name -contains 'Row') {
@@ -554,41 +555,6 @@ function Get-TargetFolderItemsByRenderListData {
     return @($result)
 }
 
-function Invoke-SPORestGet {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Url
-    )
-
-    $token = Get-PnPAccessToken -ErrorAction Stop
-    $headers = @{
-        Authorization = "Bearer $token"
-        Accept        = 'application/json;odata=nometadata'
-    }
-    return Invoke-RestMethod -Uri $Url -Method Get -Headers $headers -ErrorAction Stop
-}
-
-function Invoke-SPORestPost {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Url,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Body
-    )
-
-    $token = Get-PnPAccessToken -ErrorAction Stop
-    $headers = @{
-        Authorization  = "Bearer $token"
-        Accept         = 'application/json;odata=nometadata'
-        'Content-Type' = 'application/json'
-    }
-    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
-    return Invoke-RestMethod -Uri $Url -Method Post -Headers $headers -Body $bodyBytes -ErrorAction Stop
-}
-
 function Get-PnPRestCollectionItems {
     [CmdletBinding()]
     param(
@@ -602,7 +568,8 @@ function Get-PnPRestCollectionItems {
     while (-not [string]::IsNullOrWhiteSpace($nextUrl)) {
         Write-Verbose "Get-PnPRestCollectionItems: requesting $nextUrl"
 
-        $json = Invoke-SPORestGet -Url $nextUrl
+        $rawResponse = Invoke-PnPSPRestMethod -Method Get -Url $nextUrl -ErrorAction Stop
+        $json = ConvertFrom-PnPRestResponse -Response $rawResponse
         $pageItems = @()
         $nextLink = $null
 
