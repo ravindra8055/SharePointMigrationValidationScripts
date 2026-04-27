@@ -374,7 +374,7 @@ function Get-TargetFolderItemsByCaml {
         [string]$FolderServerRelativePath
     )
 
-        Write-Verbose "Get-TargetFolderItemsByCaml: listId=$ListId, folderServerRelativePath=$FolderServerRelativePath"
+    Write-Verbose "Get-TargetFolderItemsByCaml: listId=$ListId, folderServerRelativePath=$FolderServerRelativePath"
 
     $escapedFolderPath = [System.Security.SecurityElement]::Escape($FolderServerRelativePath)
 
@@ -392,7 +392,7 @@ function Get-TargetFolderItemsByCaml {
 </View>
 "@
 
-    $items = Get-PnPListItem -List $ListId -Query $query -PageSize 500 -ErrorAction Stop
+    $items = @(Get-PnPListItem -List $ListId -Query $query -PageSize 500 -ErrorAction Stop)
     $result = @()
 
     foreach ($item in $items) {
@@ -412,9 +412,9 @@ function Get-TargetFolderItemsByCaml {
         }
     }
 
-    Write-Verbose "Get-TargetFolderItemsByCaml: retrieved $($result.Count) items"
+    Write-Verbose "Get-TargetFolderItemsByCaml: retrieved $(@($result).Count) items"
 
-    return $result
+    return @($result)
 }
 
 function Resolve-FolderPair {
@@ -690,68 +690,43 @@ function Get-TargetFolderItemsPaged {
         $targetList = Resolve-TargetListForFolder -FolderServerRelativePath $decodedServerRelativePath -SiteUrl $TargetSiteUrl
         Write-Verbose "Get-TargetFolderItemsPaged: resolved target list id=$($targetList.Id), title=$($targetList.Title)"
 
-        # First try Get-PnPFolderItem with explicit list scope for large libraries.
-        $files = Get-PnPFolderItem -List $targetList.Id -FolderSiteRelativeUrl $SiteRelativePath -ItemType File -ErrorAction Stop
-        $subFolders = Get-PnPFolderItem -List $targetList.Id -FolderSiteRelativeUrl $SiteRelativePath -ItemType Folder -ErrorAction Stop
-        $fileCount = 0
-        $folderCount = 0
-        if ($null -ne $files) { $fileCount = $files.Count }
-        if ($null -ne $subFolders) { $folderCount = $subFolders.Count }
-        Write-Verbose "Get-TargetFolderItemsPaged: list-scoped Get-PnPFolderItem returned files=$fileCount, folders=$folderCount"
+        # Use list item paging scoped to the folder path for broad module compatibility.
+        $pagedItems = @(Get-PnPListItem -List $targetList.Id -FolderServerRelativeUrl $decodedServerRelativePath -PageSize 500 -ErrorAction Stop)
+        Write-Verbose "Get-TargetFolderItemsPaged: FolderServerRelativeUrl query returned $($pagedItems.Count) raw items"
 
         $result = @()
+        foreach ($item in $pagedItems) {
+            $fsObjType = $item.FieldValues["FSObjType"]
+            $name = [string]$item.FieldValues["FileLeafRef"]
+            $modified = $item.FieldValues["Modified"]
 
-        foreach ($file in $files) {
-            $fileLastModified = $null
-            if ($file.PSObject.Properties.Name -contains "TimeLastModified") {
-                $fileLastModified = $file.TimeLastModified
-            }
-            elseif ($file.PSObject.Properties.Name -contains "Modified") {
-                $fileLastModified = $file.Modified
-            }
-
-            $result += @{
-                Name = $file.Name
-                Type = "File"
-                LastModified = $fileLastModified
-            }
-        }
-
-        foreach ($subFolder in $subFolders) {
-            if ($subFolder.Name -eq "Forms") {
+            if ([string]::IsNullOrWhiteSpace($name)) {
                 continue
             }
 
-            $folderLastModified = $null
-            if ($subFolder.PSObject.Properties.Name -contains "TimeLastModified") {
-                $folderLastModified = $subFolder.TimeLastModified
+            if ($fsObjType -eq 0) {
+                $result += @{ Name = $name; Type = "File"; LastModified = $modified }
             }
-            elseif ($subFolder.PSObject.Properties.Name -contains "Modified") {
-                $folderLastModified = $subFolder.Modified
-            }
-
-            $result += @{
-                Name = $subFolder.Name
-                Type = "Folder"
-                LastModified = $folderLastModified
+            elseif ($fsObjType -eq 1 -and $name -ne "Forms") {
+                $result += @{ Name = $name; Type = "Folder"; LastModified = $modified }
             }
         }
 
-        Write-Verbose "Get-TargetFolderItemsPaged: normalized target item count=$($result.Count)"
+        Write-Verbose "Get-TargetFolderItemsPaged: normalized target item count=$(@($result).Count)"
 
-        return $result
+        return @($result)
     }
     catch {
-        Write-Warning "Get-TargetFolderItemsPaged: list-scoped retrieval failed for $FolderUrl. Error: $($_.Exception.Message). Retrying with CAML paging."
+        Write-Warning "Get-TargetFolderItemsPaged: FolderServerRelativeUrl retrieval failed for $FolderUrl. Error: $($_.Exception.Message). Retrying with CAML paging."
 
         if ($null -eq $targetList) {
             $targetList = Resolve-TargetListForFolder -FolderServerRelativePath $decodedServerRelativePath -SiteUrl $TargetSiteUrl
             Write-Verbose "Get-TargetFolderItemsPaged: resolved target list for CAML fallback id=$($targetList.Id), title=$($targetList.Title)"
         }
 
-        $camlItems = Get-TargetFolderItemsByCaml -ListId $targetList.Id -FolderServerRelativePath $decodedServerRelativePath
+        $camlItems = @(Get-TargetFolderItemsByCaml -ListId $targetList.Id -FolderServerRelativePath $decodedServerRelativePath)
         Write-Verbose "Get-TargetFolderItemsPaged: CAML fallback returned $($camlItems.Count) items"
-        return $camlItems
+        return @($camlItems)
     }
 }
 
