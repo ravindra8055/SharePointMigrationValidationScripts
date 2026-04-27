@@ -87,6 +87,8 @@ $script:OutputFileCounter = 1
 $script:SourceContexts = @{}
 $script:TargetContext = $null
 $script:LogLock = [System.Threading.Mutex]::new($false)
+$script:FolderCountLog = @()
+$script:ThresholdFolderCounts = @{}
 
 # Create output folder if it doesn't exist
 if (-not (Test-Path $OutputFolder)) {
@@ -168,19 +170,18 @@ function Initialize-TargetConnection {
     param()
 
     try {
+        # Check if PnP.PowerShell is installed
+        <#if (-not (Get-Module -Name PnP.PowerShell -ListAvailable)) {
+            Write-Warning "PnP.PowerShell not found. Installing..."
+            Install-Module -Name PnP.PowerShell -Scope CurrentUser -Force -AllowClobber
+        }#>
+
         Write-Host "Connecting to SharePoint Online..."
-        Write-Verbose "Initialize-TargetConnection: TargetSiteUrl=$TargetSiteUrl, TargetUsername=$TargetUsername"
         $securePassword = ConvertTo-SecureString $TargetPassword -AsPlainText -Force
         $credential = New-Object System.Management.Automation.PSCredential($TargetUsername, $securePassword)
 
         Connect-PnPOnline -Url $TargetSiteUrl -Credentials $credential -ClientId $ClientId -ErrorAction Stop
         $script:TargetContext = Get-PnPConnection
-        if ($null -eq $script:TargetContext) {
-            Write-Warning "Initialize-TargetConnection: Get-PnPConnection returned null after connect."
-        }
-        else {
-            Write-Verbose "Initialize-TargetConnection: PnP connection established successfully."
-        }
         Write-Host "[OK] Connected to SharePoint Online: $TargetSiteUrl"
     }
     catch {
@@ -269,431 +270,6 @@ function Get-SiteRelativePathFromUrl {
     }
 
     return $serverRelativePath.TrimStart('/')
-}
-
-function Test-IsListViewThresholdError {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [object]$ErrorRecord
-    )
-
-    $message = ""
-    if ($null -ne $ErrorRecord.Exception -and -not [string]::IsNullOrWhiteSpace($ErrorRecord.Exception.Message)) {
-        $message = $ErrorRecord.Exception.Message
-    }
-
-    $lowerMessage = $message.ToLowerInvariant()
-    $serverTypeName = ""
-    if ($null -ne $ErrorRecord.Exception -and $null -ne $ErrorRecord.Exception.ServerErrorTypeName) {
-        $serverTypeName = [string]$ErrorRecord.Exception.ServerErrorTypeName
-    }
-
-    if ($lowerMessage -like "*list*view*threshold*" -or
-        $lowerMessage -like "*attempted operation is prohibited*" -or
-        $lowerMessage -like "*prohibited because it exceeds*") {
-        return $true
-    }
-
-    if ($serverTypeName -eq "Microsoft.SharePoint.SPQueryThrottledException") {
-        return $true
-    }
-
-    return $false
-}
-
-function Get-LibraryIdentifierFromServerRelativePath {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$ServerRelativePath,
-
-        [Parameter(Mandatory = $true)]
-        [string]$SiteUrl
-    )
-
-    $siteUri = New-Object System.Uri($SiteUrl)
-    $sitePath = $siteUri.AbsolutePath.TrimEnd('/')
-
-    $pathAfterSite = $ServerRelativePath.TrimStart('/')
-    if ((-not [string]::IsNullOrWhiteSpace($sitePath)) -and ($sitePath -ne '/') -and $ServerRelativePath.StartsWith($sitePath, [System.StringComparison]::OrdinalIgnoreCase)) {
-        $pathAfterSite = $ServerRelativePath.Substring($sitePath.Length).TrimStart('/')
-    }
-
-    if ([string]::IsNullOrWhiteSpace($pathAfterSite)) {
-        throw "Could not derive library path from folder URL: $ServerRelativePath"
-    }
-
-    $librarySegment = $pathAfterSite.Split('/')[0]
-    if ([string]::IsNullOrWhiteSpace($librarySegment)) {
-        throw "Could not derive library segment from folder URL: $ServerRelativePath"
-    }
-
-    return [System.Uri]::UnescapeDataString($librarySegment)
-}
-
-function Resolve-TargetListForFolder {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$FolderServerRelativePath,
-
-        [Parameter(Mandatory = $true)]
-        [string]$SiteUrl
-    )
-
-    $libraryUrlName = Get-LibraryIdentifierFromServerRelativePath -ServerRelativePath $FolderServerRelativePath -SiteUrl $SiteUrl
-    $sitePath = (New-Object System.Uri($SiteUrl)).AbsolutePath.TrimEnd('/')
-    $libraryServerRelativePath = "$sitePath/$libraryUrlName"
-
-    $lists = Get-PnPList -Includes RootFolder,Title,Id -ErrorAction Stop
-    foreach ($candidateList in $lists) {
-        $candidateRootUrl = [string]$candidateList.RootFolder.ServerRelativeUrl
-        if (-not [string]::IsNullOrWhiteSpace($candidateRootUrl)) {
-            $decodedCandidateRootUrl = [System.Uri]::UnescapeDataString($candidateRootUrl)
-            if ($decodedCandidateRootUrl.Equals($libraryServerRelativePath, [System.StringComparison]::OrdinalIgnoreCase)) {
-                return $candidateList
-            }
-        }
-
-        if ($candidateList.Title -eq $libraryUrlName) {
-            return $candidateList
-        }
-    }
-
-    throw "Could not resolve target library for folder path: $FolderServerRelativePath"
-}
-
-function Get-TargetFolderItemsByCaml {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [Guid]$ListId,
-
-        [Parameter(Mandatory = $true)]
-        [string]$FolderServerRelativePath
-    )
-
-    Write-Verbose "Get-TargetFolderItemsByCaml: listId=$ListId, folderServerRelativePath=$FolderServerRelativePath"
-
-    $escapedFolderPath = [System.Security.SecurityElement]::Escape($FolderServerRelativePath)
-
-    $query = @"
-<View>
-  <Query>
-    <Where>
-      <Eq>
-        <FieldRef Name='FileDirRef' />
-        <Value Type='Text'>$escapedFolderPath</Value>
-      </Eq>
-    </Where>
-  </Query>
-  <RowLimit Paged='TRUE'>500</RowLimit>
-</View>
-"@
-
-    $items = @(Get-PnPListItem -List $ListId -Query $query -PageSize 500 -ErrorAction Stop)
-    $result = @()
-
-    foreach ($item in $items) {
-        $fsObjType = $item.FieldValues["FSObjType"]
-        $name = [string]$item.FieldValues["FileLeafRef"]
-        $modified = $item.FieldValues["Modified"]
-
-        if ([string]::IsNullOrWhiteSpace($name)) {
-            continue
-        }
-
-        if ($fsObjType -eq 0) {
-            $result += @{ Name = $name; Type = "File"; LastModified = $modified }
-        }
-        elseif ($fsObjType -eq 1 -and $name -ne "Forms") {
-            $result += @{ Name = $name; Type = "Folder"; LastModified = $modified }
-        }
-    }
-
-    Write-Verbose "Get-TargetFolderItemsByCaml: retrieved $(@($result).Count) items"
-
-    return @($result)
-}
-
-function ConvertFrom-PnPRestResponse {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [object]$Response
-    )
-
-    if ($Response -is [string]) {
-        return ($Response | ConvertFrom-Json)
-    }
-
-    return $Response
-}
-
-function Get-ObjectPropertyValue {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [object]$InputObject,
-
-        [Parameter(Mandatory = $true)]
-        [string[]]$PropertyNames
-    )
-
-    foreach ($propertyName in $PropertyNames) {
-        $property = $InputObject.PSObject.Properties[$propertyName]
-        if ($null -ne $property) {
-            return $property.Value
-        }
-    }
-
-    return $null
-}
-
-function Convert-RenderListDataRowsToTargetItems {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [object[]]$Rows
-    )
-
-    $result = @()
-    foreach ($row in $Rows) {
-        $name = [string](Get-ObjectPropertyValue -InputObject $row -PropertyNames @('FileLeafRef', 'FileLeafRef.Name', 'FileName'))
-        $modified = Get-ObjectPropertyValue -InputObject $row -PropertyNames @('Modified', 'Modified.', 'TimeLastModified')
-        $fsObjTypeValue = Get-ObjectPropertyValue -InputObject $row -PropertyNames @('FSObjType', '.FSObjType')
-        $contentType = [string](Get-ObjectPropertyValue -InputObject $row -PropertyNames @('ContentType', 'ContentTypeId'))
-
-        if ([string]::IsNullOrWhiteSpace($name) -or $name -eq 'Forms') {
-            continue
-        }
-
-        $itemType = ''
-        if (($null -ne $fsObjTypeValue) -and ([string]$fsObjTypeValue -eq '1')) {
-            $itemType = 'Folder'
-        }
-        elseif (($null -ne $fsObjTypeValue) -and ([string]$fsObjTypeValue -eq '0')) {
-            $itemType = 'File'
-        }
-        elseif ($contentType -like '0x0120*') {
-            $itemType = 'Folder'
-        }
-        else {
-            $itemType = 'File'
-        }
-
-        $result += @{
-            Name = $name
-            Type = $itemType
-            LastModified = $modified
-        }
-    }
-
-    return @($result)
-}
-
-function Get-TargetFolderItemsByRenderListData {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$ListServerRelativePath,
-
-        [Parameter(Mandatory = $true)]
-        [string]$FolderServerRelativePath
-    )
-
-    Write-Verbose "Get-TargetFolderItemsByRenderListData: listServerRelativePath=$ListServerRelativePath, folderServerRelativePath=$FolderServerRelativePath"
-
-    $baseApiUrl = $TargetSiteUrl.TrimEnd('/')
-    $encodedListPath = [System.Uri]::EscapeUriString($ListServerRelativePath)
-    $endpoint = "$baseApiUrl/_api/web/GetList(@listUrl)/RenderListDataAsStream?@listUrl='$encodedListPath'"
-    $rows = @()
-    $paging = $null
-
-    do {
-        $parameters = @{
-            RenderOptions = 2
-            FolderServerRelativeUrl = $FolderServerRelativePath
-            ViewXml = '<View Scope="Default"><RowLimit Paged="TRUE">500</RowLimit></View>'
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace($paging)) {
-            $parameters.Paging = $paging
-        }
-
-        $bodyObject = @{ parameters = $parameters }
-        $body = $bodyObject | ConvertTo-Json -Depth 10
-
-        Write-Verbose "Get-TargetFolderItemsByRenderListData: requesting page with paging token present=$(-not [string]::IsNullOrWhiteSpace($paging))"
-        $rawResponse = Invoke-PnPSPRestMethod -Method Post -Url $endpoint -Content $body -ContentType 'application/json;odata=nometadata' -ErrorAction Stop
-        $json = ConvertFrom-PnPRestResponse -Response $rawResponse
-
-        $pageRows = @()
-        if ($json.PSObject.Properties.Name -contains 'Row') {
-            $pageRows = @($json.Row)
-        }
-        elseif (($json.PSObject.Properties.Name -contains 'ListData') -and ($json.ListData.PSObject.Properties.Name -contains 'Row')) {
-            $pageRows = @($json.ListData.Row)
-        }
-
-        $rows += $pageRows
-        $paging = $null
-
-        if ($json.PSObject.Properties.Name -contains 'NextHref') {
-            $paging = [string]$json.NextHref
-        }
-        elseif (($json.PSObject.Properties.Name -contains 'ListData') -and ($json.ListData.PSObject.Properties.Name -contains 'NextHref')) {
-            $paging = [string]$json.ListData.NextHref
-        }
-    }
-    while (-not [string]::IsNullOrWhiteSpace($paging))
-
-    Write-Verbose "Get-TargetFolderItemsByRenderListData: raw rows returned=$($rows.Count)"
-    $result = Convert-RenderListDataRowsToTargetItems -Rows $rows
-    Write-Verbose "Get-TargetFolderItemsByRenderListData: normalized target item count=$($result.Count)"
-    return @($result)
-}
-
-function Get-PnPRestCollectionItems {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RequestUrl
-    )
-
-    $allItems = @()
-    $nextUrl = $RequestUrl
-
-    while (-not [string]::IsNullOrWhiteSpace($nextUrl)) {
-        Write-Verbose "Get-PnPRestCollectionItems: requesting $nextUrl"
-
-        $rawResponse = Invoke-PnPSPRestMethod -Method Get -Url $nextUrl -ErrorAction Stop
-        $json = ConvertFrom-PnPRestResponse -Response $rawResponse
-        $pageItems = @()
-        $nextLink = $null
-
-        if ($json.PSObject.Properties.Name -contains 'd') {
-            if ($json.d.PSObject.Properties.Name -contains 'results') {
-                $pageItems = @($json.d.results)
-            }
-            else {
-                $pageItems = @($json.d)
-            }
-
-            if ($json.d.PSObject.Properties.Name -contains '__next') {
-                $nextLink = [string]$json.d.__next
-            }
-        }
-        else {
-            if ($json.PSObject.Properties.Name -contains 'value') {
-                $pageItems = @($json.value)
-            }
-            else {
-                $pageItems = @($json)
-            }
-
-            if ($json.PSObject.Properties.Name -contains '@odata.nextLink') {
-                $nextLink = [string]$json.'@odata.nextLink'
-            }
-            elseif ($json.PSObject.Properties.Name -contains 'odata.nextLink') {
-                $nextLink = [string]$json.'odata.nextLink'
-            }
-        }
-
-        $allItems += $pageItems
-
-        $nextUrl = $nextLink
-    }
-
-    return @($allItems)
-}
-
-function Get-TargetFolderItemsByRest {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$FolderServerRelativePath
-    )
-
-    Write-Verbose "Get-TargetFolderItemsByRest: folderServerRelativePath=$FolderServerRelativePath"
-
-    $escapedFolderPath = $FolderServerRelativePath.Replace("'", "''")
-    $encodedFolderPath = [System.Uri]::EscapeUriString($escapedFolderPath)
-    $baseApiUrl = $TargetSiteUrl.TrimEnd('/')
-
-    $filesUrl = "$baseApiUrl/_api/web/GetFolderByServerRelativePath(decodedurl='$encodedFolderPath')/Files?`$select=Name,TimeLastModified,ServerRelativeUrl&`$top=5000"
-    $foldersUrl = "$baseApiUrl/_api/web/GetFolderByServerRelativePath(decodedurl='$encodedFolderPath')/Folders?`$select=Name,TimeLastModified,ServerRelativeUrl&`$top=5000"
-
-    Write-Verbose "Get-TargetFolderItemsByRest: filesUrl=$filesUrl"
-    Write-Verbose "Get-TargetFolderItemsByRest: foldersUrl=$foldersUrl"
-
-    $files = @(Get-PnPRestCollectionItems -RequestUrl $filesUrl)
-    $folders = @(Get-PnPRestCollectionItems -RequestUrl $foldersUrl)
-
-    Write-Verbose "Get-TargetFolderItemsByRest: files=$($files.Count), folders=$($folders.Count)"
-
-    $result = @()
-
-    foreach ($file in $files) {
-        $fileName = [string]$file.Name
-        if ([string]::IsNullOrWhiteSpace($fileName)) {
-            continue
-        }
-
-        $result += @{
-            Name = $fileName
-            Type = 'File'
-            LastModified = $file.TimeLastModified
-        }
-    }
-
-    foreach ($folder in $folders) {
-        $folderName = [string]$folder.Name
-        if ([string]::IsNullOrWhiteSpace($folderName) -or $folderName -eq 'Forms') {
-            continue
-        }
-
-        $result += @{
-            Name = $folderName
-            Type = 'Folder'
-            LastModified = $folder.TimeLastModified
-        }
-    }
-
-    Write-Verbose "Get-TargetFolderItemsByRest: normalized target item count=$(@($result).Count)"
-    return @($result)
-}
-
-function Get-TargetFolderItemCount {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$FolderServerRelativePath
-    )
-
-    Write-Verbose "Get-TargetFolderItemCount: folderServerRelativePath=$FolderServerRelativePath"
-
-    $escapedPath = $FolderServerRelativePath.Replace("'", "''")
-    $encodedPath = [System.Uri]::EscapeUriString($escapedPath)
-    $baseApiUrl = $TargetSiteUrl.TrimEnd('/')
-    $url = "$baseApiUrl/_api/web/GetFolderByServerRelativePath(decodedurl='$encodedPath')?`$select=ItemCount"
-
-    $rawResponse = Invoke-PnPSPRestMethod -Method Get -Url $url -ErrorAction Stop
-    $json = ConvertFrom-PnPRestResponse -Response $rawResponse
-
-    $itemCount = -1
-    if ($json.PSObject.Properties.Name -contains 'ItemCount') {
-        $itemCount = [int]$json.ItemCount
-    }
-    elseif ($json.PSObject.Properties.Name -contains 'd') {
-        if ($json.d.PSObject.Properties.Name -contains 'ItemCount') {
-            $itemCount = [int]$json.d.ItemCount
-        }
-    }
-
-    Write-Verbose "Get-TargetFolderItemCount: ItemCount=$itemCount"
-    return $itemCount
 }
 
 function Resolve-FolderPair {
@@ -839,16 +415,6 @@ function Get-TargetFolderItems {
 
     try {
         $siteRelativePath = Get-SiteRelativePathFromUrl -Url $FolderUrl -SiteUrl $TargetSiteUrl
-        Write-Verbose "Get-TargetFolderItems: folderUrl=$FolderUrl"
-        Write-Verbose "Get-TargetFolderItems: siteRelativePath=$siteRelativePath"
-
-        $currentPnPConnection = Get-PnPConnection -ErrorAction SilentlyContinue
-        if ($null -eq $currentPnPConnection) {
-            Write-Warning "Get-TargetFolderItems: No active PnP connection detected before query."
-        }
-        else {
-            Write-Verbose "Get-TargetFolderItems: Active PnP connection detected."
-        }
 
         if ([string]::IsNullOrWhiteSpace($siteRelativePath)) {
             throw "Could not derive site-relative folder path from target URL: $FolderUrl"
@@ -858,40 +424,27 @@ function Get-TargetFolderItems {
         $subFolders = $null
 
         try {
-            Write-Verbose "Get-TargetFolderItems: querying target via Get-PnPFolderItem (siteRelativePath)"
             $files = Get-PnPFolderItem -FolderSiteRelativeUrl $siteRelativePath -ItemType File -ErrorAction Stop
             $subFolders = Get-PnPFolderItem -FolderSiteRelativeUrl $siteRelativePath -ItemType Folder -ErrorAction Stop
-            $fileCount = 0
-            $folderCount = 0
-            if ($null -ne $files) { $fileCount = $files.Count }
-            if ($null -ne $subFolders) { $folderCount = $subFolders.Count }
-            Write-Verbose "Get-TargetFolderItems: Get-PnPFolderItem returned files=$fileCount, folders=$folderCount"
         }
         catch {
-            if (Test-IsListViewThresholdError -ErrorRecord $_) {
-                # Folder exceeds list view threshold - fall back to paged retrieval
-                Write-Warning "Get-TargetFolderItems: threshold detected for $FolderUrl. Switching to paged fallback."
+            $errMsg = $_.Exception.Message
+            if ($errMsg -like "*list view threshold*" -or $errMsg -like "*prohibited because it exceeds*") {
+                # Folder exceeds list view threshold -- fall back to paged retrieval
                 return Get-TargetFolderItemsPaged -SiteRelativePath $siteRelativePath -FolderUrl $FolderUrl
             }
 
-            # Some tenants/sites require encoded folder paths - retry with encoding
+            # Some tenants/sites require encoded folder paths -- retry with encoding
             $encodedSiteRelativePath = [System.Uri]::EscapeUriString($siteRelativePath)
-            Write-Verbose "Get-TargetFolderItems: retrying Get-PnPFolderItem with encoded path=$encodedSiteRelativePath"
             try {
                 $files = Get-PnPFolderItem -FolderSiteRelativeUrl $encodedSiteRelativePath -ItemType File -ErrorAction Stop
                 $subFolders = Get-PnPFolderItem -FolderSiteRelativeUrl $encodedSiteRelativePath -ItemType Folder -ErrorAction Stop
-                $encodedFileCount = 0
-                $encodedFolderCount = 0
-                if ($null -ne $files) { $encodedFileCount = $files.Count }
-                if ($null -ne $subFolders) { $encodedFolderCount = $subFolders.Count }
-                Write-Verbose "Get-TargetFolderItems: encoded Get-PnPFolderItem returned files=$encodedFileCount, folders=$encodedFolderCount"
             }
             catch {
-                if (Test-IsListViewThresholdError -ErrorRecord $_) {
-                    Write-Warning "Get-TargetFolderItems: threshold detected on encoded path for $FolderUrl. Switching to paged fallback."
+                $errMsg2 = $_.Exception.Message
+                if ($errMsg2 -like "*list view threshold*" -or $errMsg2 -like "*prohibited because it exceeds*") {
                     return Get-TargetFolderItemsPaged -SiteRelativePath $encodedSiteRelativePath -FolderUrl $FolderUrl
                 }
-                Write-Warning "Get-TargetFolderItems: encoded path query failed for $FolderUrl. Error: $($_.Exception.Message)"
                 throw
             }
         }
@@ -936,8 +489,6 @@ function Get-TargetFolderItems {
             }
         }
 
-        Write-Verbose "Get-TargetFolderItems: normalized target item count=$($result.Count)"
-
         return $result
     }
     catch {
@@ -963,97 +514,89 @@ function Get-TargetFolderItemsPaged {
 
     $serverRelativePath = Get-ServerRelativePathFromUrl -Url $FolderUrl -SiteUrl $TargetSiteUrl
 
-    $decodedServerRelativePath = [System.Uri]::UnescapeDataString($serverRelativePath)
-    $targetList = $null
+    # Derive the library URL name -- first path segment after the site base path
+    $siteUri = New-Object System.Uri($TargetSiteUrl)
+    $sitePath = $siteUri.AbsolutePath.TrimEnd('/')
+    $pathAfterSite = $serverRelativePath.Substring($sitePath.Length).TrimStart('/')
+    $libraryUrlName = $pathAfterSite.Split('/')[0]
+
+    # Get-PnPListItem with -FolderServerRelativeUrl and -PageSize bypasses the list view threshold.
+    # If the library also exceeds the threshold, fall back to folder ItemCount comparison.
+    $allItems = $null
     try {
-        $targetList = Resolve-TargetListForFolder -FolderServerRelativePath $decodedServerRelativePath -SiteUrl $TargetSiteUrl
-        Write-Verbose "Get-TargetFolderItemsPaged: resolved target list id=$($targetList.Id), title=$($targetList.Title)"
-
-        # Use list item paging scoped to the folder path for broad module compatibility.
-        $pagedItems = @(Get-PnPListItem -List $targetList.Id -FolderServerRelativeUrl $decodedServerRelativePath -PageSize 500 -ErrorAction Stop)
-        Write-Verbose "Get-TargetFolderItemsPaged: FolderServerRelativeUrl query returned $($pagedItems.Count) raw items"
-
-        $result = @()
-        foreach ($item in $pagedItems) {
-            $fsObjType = $item.FieldValues["FSObjType"]
-            $name = [string]$item.FieldValues["FileLeafRef"]
-            $modified = $item.FieldValues["Modified"]
-
-            if ([string]::IsNullOrWhiteSpace($name)) {
-                continue
-            }
-
-            if ($fsObjType -eq 0) {
-                $result += @{ Name = $name; Type = "File"; LastModified = $modified }
-            }
-            elseif ($fsObjType -eq 1 -and $name -ne "Forms") {
-                $result += @{ Name = $name; Type = "Folder"; LastModified = $modified }
-            }
-        }
-
-        Write-Verbose "Get-TargetFolderItemsPaged: normalized target item count=$(@($result).Count)"
-
-        return @($result)
+        $allItems = Get-PnPListItem -List $libraryUrlName -FolderServerRelativeUrl $serverRelativePath -PageSize 500 -ErrorAction Stop
     }
     catch {
-        Write-Warning "Get-TargetFolderItemsPaged: FolderServerRelativeUrl retrieval failed for $FolderUrl. Error: $($_.Exception.Message). Retrying with CAML paging."
-
-        if ($null -eq $targetList) {
-            $targetList = Resolve-TargetListForFolder -FolderServerRelativePath $decodedServerRelativePath -SiteUrl $TargetSiteUrl
-            Write-Verbose "Get-TargetFolderItemsPaged: resolved target list for CAML fallback id=$($targetList.Id), title=$($targetList.Title)"
-        }
-
-        try {
-            $camlItems = @(Get-TargetFolderItemsByCaml -ListId $targetList.Id -FolderServerRelativePath $decodedServerRelativePath)
-            Write-Verbose "Get-TargetFolderItemsPaged: CAML fallback returned $($camlItems.Count) items"
-
-            if ($camlItems.Count -gt 0) {
-                return @($camlItems)
+        $pagedErrMsg = $_.Exception.Message
+        if ($pagedErrMsg -like "*list view threshold*" -or $pagedErrMsg -like "*prohibited because it exceeds*" -or $pagedErrMsg -like "*attempted operation is prohibited*") {
+            Write-Warning "Get-TargetFolderItemsPaged: threshold also exceeded for $FolderUrl. Falling back to folder ItemCount comparison."
+            $targetCount = -1
+            try {
+                $targetCount = Get-TargetFolderItemCount -FolderServerRelativePath $serverRelativePath
             }
-
-            Write-Warning "Get-TargetFolderItemsPaged: CAML fallback returned zero items for $FolderUrl. Retrying with REST folder enumeration."
-        }
-        catch {
-            Write-Warning "Get-TargetFolderItemsPaged: CAML fallback failed for $FolderUrl. Error: $($_.Exception.Message). Retrying with REST folder enumeration."
-        }
-
-        try {
-            $renderItems = @(Get-TargetFolderItemsByRenderListData -ListServerRelativePath $targetList.RootFolder.ServerRelativeUrl -FolderServerRelativePath $decodedServerRelativePath)
-            Write-Verbose "Get-TargetFolderItemsPaged: RenderListData fallback returned $($renderItems.Count) items"
-
-            if ($renderItems.Count -gt 0) {
-                return @($renderItems)
+            catch {
+                $countErrMsg = $_.Exception.Message
+                Write-Warning "Get-TargetFolderItemsPaged: ItemCount fetch failed for $FolderUrl. Error: $countErrMsg"
             }
-
-            Write-Warning "Get-TargetFolderItemsPaged: RenderListData fallback returned zero items for $FolderUrl. Retrying with REST folder enumeration."
-        }
-        catch {
-            Write-Warning "Get-TargetFolderItemsPaged: RenderListData fallback failed for $FolderUrl. Error: $($_.Exception.Message). Retrying with REST folder enumeration."
-        }
-
-        try {
-            $restItems = @(Get-TargetFolderItemsByRest -FolderServerRelativePath $decodedServerRelativePath)
-            Write-Verbose "Get-TargetFolderItemsPaged: REST fallback returned $($restItems.Count) items"
-            if ($restItems.Count -gt 0) {
-                return @($restItems)
-            }
-            Write-Warning "Get-TargetFolderItemsPaged: REST fallback returned zero items for $FolderUrl. Falling back to item count comparison."
-        }
-        catch {
-            Write-Warning "Get-TargetFolderItemsPaged: REST fallback failed for $FolderUrl. Error: $($_.Exception.Message). Falling back to item count comparison."
-        }
-
-        # Last resort: fetch folder ItemCount property (single scalar, never throttled)
-        try {
-            $targetItemCount = Get-TargetFolderItemCount -FolderServerRelativePath $decodedServerRelativePath
-            Write-Warning "Get-TargetFolderItemsPaged: All enumeration methods exhausted for $FolderUrl. Returning count-only sentinel (ItemCount=$targetItemCount)."
-            return @(@{ _CountOnlySentinel = $true; TargetItemCount = $targetItemCount })
-        }
-        catch {
-            Write-Warning "Get-TargetFolderItemsPaged: Item count fallback also failed for $FolderUrl. Error: $($_.Exception.Message)"
+            $script:ThresholdFolderCounts[$FolderUrl] = $targetCount
             return @()
         }
+        throw
     }
+
+    if ($null -eq $allItems) { $allItems = @() }
+    $result = @()
+    foreach ($item in $allItems) {
+        $fsObjType = $item.FieldValues["FSObjType"]
+        $name      = $item.FieldValues["FileLeafRef"]
+        $modified  = $item.FieldValues["Modified"]
+
+        if ($fsObjType -eq 0) {
+            $result += @{ Name = $name; Type = "File"; LastModified = $modified }
+        }
+        elseif ($fsObjType -eq 1 -and $name -ne "Forms") {
+            $result += @{ Name = $name; Type = "Folder"; LastModified = $modified }
+        }
+    }
+
+    return $result
+}
+
+# ==========================================
+# Function: Get Target Folder Item Count via REST
+# ==========================================
+function Get-TargetFolderItemCount {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FolderServerRelativePath
+    )
+
+    $escapedPath = $FolderServerRelativePath.Replace("'", "''")
+    $encodedPath = [System.Uri]::EscapeUriString($escapedPath)
+    $baseApiUrl = $TargetSiteUrl.TrimEnd('/')
+    $url = "$baseApiUrl/_api/web/GetFolderByServerRelativePath(decodedurl='$encodedPath')?`$select=ItemCount"
+
+    Write-Verbose "Get-TargetFolderItemCount: url=$url"
+    $rawResponse = Invoke-PnPSPRestMethod -Method Get -Url $url -ErrorAction Stop
+
+    $json = $rawResponse
+    if ($rawResponse -is [string]) {
+        $json = $rawResponse | ConvertFrom-Json
+    }
+
+    $itemCount = -1
+    if ($json.PSObject.Properties.Name -contains 'ItemCount') {
+        $itemCount = [int]$json.ItemCount
+    }
+    elseif ($json.PSObject.Properties.Name -contains 'd') {
+        if ($json.d.PSObject.Properties.Name -contains 'ItemCount') {
+            $itemCount = [int]$json.d.ItemCount
+        }
+    }
+
+    Write-Verbose "Get-TargetFolderItemCount: ItemCount=$itemCount"
+    return $itemCount
 }
 
 # ==========================================
@@ -1091,27 +634,37 @@ function Compare-FolderPair {
 
     # Get target items
     $targetItems = Get-TargetFolderItems -FolderUrl $TargetFolderUrl
-    
+
     if ($null -eq $targetItems) {
         $targetItems = @()
     }
 
-    # Count-only sentinel: all enumeration methods exhausted, compare by ItemCount only.
-    # PS 5.1 may unwrap the return array so $targetItems could be the bare hashtable OR
-    # an array whose first element is the hashtable — check both.
-    $sentinelItem = $null
-    if ($targetItems -is [hashtable] -and $targetItems.ContainsKey('_CountOnlySentinel')) {
-        $sentinelItem = $targetItems
-    }
-    elseif (($null -ne $targetItems) -and ($targetItems.Count -ge 1) -and ($targetItems[0] -is [hashtable]) -and $targetItems[0].ContainsKey('_CountOnlySentinel')) {
-        $sentinelItem = $targetItems[0]
-    }
+    # If this folder hit the list view threshold, all enumeration returned empty.
+    # Use the stored ItemCount for a count-only comparison instead.
+    if ($script:ThresholdFolderCounts.ContainsKey($TargetFolderUrl)) {
+        $targetItemCount = $script:ThresholdFolderCounts[$TargetFolderUrl]
+        $sourceCount = $sourceItems.Count
+        $itemDiff = -1
+        $countStatus = 'Error'
+        if ($targetItemCount -ge 0) {
+            $itemDiff = $sourceCount - $targetItemCount
+            if ($itemDiff -eq 0) { $countStatus = 'Match' } else { $countStatus = 'CountMismatch' }
+        }
 
-    if ($null -ne $sentinelItem) {
-        $targetItemCount = [int]$sentinelItem.TargetItemCount
-        Write-Warning "Compare-FolderPair: count-only comparison for '$InputFolderPath'. Source=$($sourceItems.Count) Target=$targetItemCount"
+        Write-Warning "Compare-FolderPair: count-only comparison for '$InputFolderPath'. Source=$sourceCount Target=$targetItemCount Status=$countStatus"
+
+        $script:FolderCountLog += [PSCustomObject]@{
+            Timestamp        = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            SourceFolderPath = $InputFolderPath
+            TargetFolderPath = $InputFolderPath
+            SourceItemCount  = $sourceCount
+            TargetItemCount  = $targetItemCount
+            Difference       = $itemDiff
+            Status           = $countStatus
+        }
+
         $countDiffItems = @()
-        if ($targetItemCount -ne $sourceItems.Count) {
+        if ($countStatus -ne 'Match') {
             $countDiffItems += @{
                 Name            = '(ItemCount)'
                 Type            = 'CountMismatch'
@@ -1119,19 +672,15 @@ function Compare-FolderPair {
                 SourceUrl       = $SourceFolderUrl
                 TargetUrl       = $TargetFolderUrl
                 InputFolderPath = $InputFolderPath
-                Status          = "CountMismatch: Source=$($sourceItems.Count) Target=$targetItemCount"
+                Status          = "CountMismatch: Source=$sourceCount Target=$targetItemCount"
             }
         }
+
         return @{
             Status          = 'Success'
             DifferenceItems = $countDiffItems
-            SourceItemCount = $sourceItems.Count
+            SourceItemCount = $sourceCount
         }
-    }
-
-    Write-Verbose "Compare-FolderPair: sourceItems=$($sourceItems.Count), targetItems=$($targetItems.Count), folder=$InputFolderPath"
-    if (($sourceItems.Count -gt 0) -and ($targetItems.Count -eq 0)) {
-        Write-Warning "Compare-FolderPair: target returned zero items while source has $($sourceItems.Count) items for folder: $InputFolderPath"
     }
 
     # Create lookup table for faster comparison
@@ -1260,6 +809,29 @@ function Export-MissingItemsToFile {
 }
 
 # ==========================================
+# Function: Export Folder Item Count Log
+# ==========================================
+function Export-FolderCountLog {
+    [CmdletBinding()]
+    param()
+
+    if ($script:FolderCountLog.Count -eq 0) {
+        return
+    }
+
+    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $outputFile = Join-Path $OutputFolder "FolderItemCounts_$timestamp.csv"
+
+    try {
+        $script:FolderCountLog | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8 -Force
+        Write-Host "[OK] Exported $($script:FolderCountLog.Count) threshold folder records to $outputFile"
+    }
+    catch {
+        Write-Error "Failed to export folder count log: $_"
+    }
+}
+
+# ==========================================
 # Function: Process Folder Pair (Job Item)
 # ==========================================
 function Invoke-FolderComparison {
@@ -1303,10 +875,11 @@ function Invoke-FolderComparison {
             $script:FailedFolders++
         }
 
-        Write-Host ("Processed: {0} ({1} differences)" -f $SourceUrl, $result.DifferenceItems.Count)
+        $diffCount = $result.DifferenceItems.Count
+        Write-Host "Processed: $SourceUrl ($diffCount differences)"
     }
     catch {
-        Write-Error ("Error processing pair {0} to {1} : {2}" -f $SourceUrl, $TargetUrl, $_)
+        Write-Error "Error processing pair $SourceUrl <-> $TargetUrl : $_"
         $script:FailedFolders++
     }
 }
@@ -1351,7 +924,7 @@ function Invoke-Migration {
     # Process folder pairs using runspace pool for parallelization
     $startTime = Get-Date
     $processedCount = 0
-    $ThreadCount=0
+
     if ($ThreadCount -gt 1) {
         # Use runspace pool for multi-threaded execution
         $runspacePool = [runspacefactory]::CreateRunspacePool(1, $ThreadCount)
@@ -1398,6 +971,11 @@ function Invoke-Migration {
     # Export remaining items
     if ($script:MissingItems.Count -gt 0) {
         Export-MissingItemsToFile
+    }
+
+    # Export folder item count log (folders that hit list view threshold)
+    if ($script:FolderCountLog.Count -gt 0) {
+        Export-FolderCountLog
     }
 
     # Generate summary report
