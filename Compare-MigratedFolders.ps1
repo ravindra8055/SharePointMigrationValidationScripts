@@ -168,12 +168,6 @@ function Initialize-TargetConnection {
     param()
 
     try {
-        # Check if PnP.PowerShell is installed
-        if (-not (Get-Module -Name PnP.PowerShell -ListAvailable)) {
-            Write-Warning "PnP.PowerShell not found. Installing..."
-            Install-Module -Name PnP.PowerShell -Scope CurrentUser -Force -AllowClobber
-        }
-
         Write-Host "Connecting to SharePoint Online..."
         $securePassword = ConvertTo-SecureString $TargetPassword -AsPlainText -Force
         $credential = New-Object System.Management.Automation.PSCredential($TargetUsername, $securePassword)
@@ -329,6 +323,87 @@ function Get-LibraryIdentifierFromServerRelativePath {
     }
 
     return [System.Uri]::UnescapeDataString($librarySegment)
+}
+
+function Resolve-TargetListForFolder {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FolderServerRelativePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SiteUrl
+    )
+
+    $libraryUrlName = Get-LibraryIdentifierFromServerRelativePath -ServerRelativePath $FolderServerRelativePath -SiteUrl $SiteUrl
+    $sitePath = (New-Object System.Uri($SiteUrl)).AbsolutePath.TrimEnd('/')
+    $libraryServerRelativePath = "$sitePath/$libraryUrlName"
+
+    $lists = Get-PnPList -Includes RootFolder,Title,Id -ErrorAction Stop
+    foreach ($candidateList in $lists) {
+        $candidateRootUrl = [string]$candidateList.RootFolder.ServerRelativeUrl
+        if (-not [string]::IsNullOrWhiteSpace($candidateRootUrl)) {
+            $decodedCandidateRootUrl = [System.Uri]::UnescapeDataString($candidateRootUrl)
+            if ($decodedCandidateRootUrl.Equals($libraryServerRelativePath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $candidateList
+            }
+        }
+
+        if ($candidateList.Title -eq $libraryUrlName) {
+            return $candidateList
+        }
+    }
+
+    throw "Could not resolve target library for folder path: $FolderServerRelativePath"
+}
+
+function Get-TargetFolderItemsByCaml {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [Guid]$ListId,
+
+        [Parameter(Mandatory = $true)]
+        [string]$FolderServerRelativePath
+    )
+
+    $escapedFolderPath = [System.Security.SecurityElement]::Escape($FolderServerRelativePath)
+
+    $query = @"
+<View>
+  <Query>
+    <Where>
+      <Eq>
+        <FieldRef Name='FileDirRef' />
+        <Value Type='Text'>$escapedFolderPath</Value>
+      </Eq>
+    </Where>
+  </Query>
+  <RowLimit Paged='TRUE'>500</RowLimit>
+</View>
+"@
+
+    $items = Get-PnPListItem -List $ListId -Query $query -PageSize 500 -ErrorAction Stop
+    $result = @()
+
+    foreach ($item in $items) {
+        $fsObjType = $item.FieldValues["FSObjType"]
+        $name = [string]$item.FieldValues["FileLeafRef"]
+        $modified = $item.FieldValues["Modified"]
+
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            continue
+        }
+
+        if ($fsObjType -eq 0) {
+            $result += @{ Name = $name; Type = "File"; LastModified = $modified }
+        }
+        elseif ($fsObjType -eq 1 -and $name -ne "Forms") {
+            $result += @{ Name = $name; Type = "Folder"; LastModified = $modified }
+        }
+    }
+
+    return $result
 }
 
 function Resolve-FolderPair {
@@ -572,48 +647,63 @@ function Get-TargetFolderItemsPaged {
     $serverRelativePath = Get-ServerRelativePathFromUrl -Url $FolderUrl -SiteUrl $TargetSiteUrl
 
     $decodedServerRelativePath = [System.Uri]::UnescapeDataString($serverRelativePath)
-    $libraryUrlName = Get-LibraryIdentifierFromServerRelativePath -ServerRelativePath $decodedServerRelativePath -SiteUrl $TargetSiteUrl
-
-    $allItems = $null
+    $targetList = $null
     try {
-        # Get-PnPListItem with -FolderServerRelativeUrl and -PageSize bypasses the list view threshold in most cases.
-        $allItems = Get-PnPListItem -List $libraryUrlName -FolderServerRelativeUrl $decodedServerRelativePath -PageSize 500 -ErrorAction Stop
-    }
-    catch {
-        # Fallback to resolving the list object by root folder path and retrying by list ID.
-        $lists = Get-PnPList -Includes RootFolder -ErrorAction Stop
-        $matchingList = $null
-        $libraryServerRelativePath = "$((New-Object System.Uri($TargetSiteUrl)).AbsolutePath.TrimEnd('/'))/$libraryUrlName"
+        $targetList = Resolve-TargetListForFolder -FolderServerRelativePath $decodedServerRelativePath -SiteUrl $TargetSiteUrl
 
-        foreach ($candidateList in $lists) {
-            if ($candidateList.RootFolder.ServerRelativeUrl.Equals($libraryServerRelativePath, [System.StringComparison]::OrdinalIgnoreCase)) {
-                $matchingList = $candidateList
-                break
+        # First try Get-PnPFolderItem with explicit list scope for large libraries.
+        $files = Get-PnPFolderItem -List $targetList.Id -FolderSiteRelativeUrl $SiteRelativePath -ItemType File -ErrorAction Stop
+        $subFolders = Get-PnPFolderItem -List $targetList.Id -FolderSiteRelativeUrl $SiteRelativePath -ItemType Folder -ErrorAction Stop
+
+        $result = @()
+
+        foreach ($file in $files) {
+            $fileLastModified = $null
+            if ($file.PSObject.Properties.Name -contains "TimeLastModified") {
+                $fileLastModified = $file.TimeLastModified
+            }
+            elseif ($file.PSObject.Properties.Name -contains "Modified") {
+                $fileLastModified = $file.Modified
+            }
+
+            $result += @{
+                Name = $file.Name
+                Type = "File"
+                LastModified = $fileLastModified
             }
         }
 
-        if ($null -eq $matchingList) {
-            throw
+        foreach ($subFolder in $subFolders) {
+            if ($subFolder.Name -eq "Forms") {
+                continue
+            }
+
+            $folderLastModified = $null
+            if ($subFolder.PSObject.Properties.Name -contains "TimeLastModified") {
+                $folderLastModified = $subFolder.TimeLastModified
+            }
+            elseif ($subFolder.PSObject.Properties.Name -contains "Modified") {
+                $folderLastModified = $subFolder.Modified
+            }
+
+            $result += @{
+                Name = $subFolder.Name
+                Type = "Folder"
+                LastModified = $folderLastModified
+            }
         }
 
-        $allItems = Get-PnPListItem -List $matchingList.Id -FolderServerRelativeUrl $decodedServerRelativePath -PageSize 500 -ErrorAction Stop
+        return $result
     }
+    catch {
+        Write-Verbose "Get-PnPFolderItem fallback failed for $FolderUrl. Retrying with CAML paging."
 
-    $result = @()
-    foreach ($item in $allItems) {
-        $fsObjType = $item.FieldValues["FSObjType"]
-        $name      = $item.FieldValues["FileLeafRef"]
-        $modified  = $item.FieldValues["Modified"]
+        if ($null -eq $targetList) {
+            $targetList = Resolve-TargetListForFolder -FolderServerRelativePath $decodedServerRelativePath -SiteUrl $TargetSiteUrl
+        }
 
-        if ($fsObjType -eq 0) {
-            $result += @{ Name = $name; Type = "File"; LastModified = $modified }
-        }
-        elseif ($fsObjType -eq 1 -and $name -ne "Forms") {
-            $result += @{ Name = $name; Type = "Folder"; LastModified = $modified }
-        }
+        return Get-TargetFolderItemsByCaml -ListId $targetList.Id -FolderServerRelativePath $decodedServerRelativePath
     }
-
-    return $result
 }
 
 # ==========================================
