@@ -506,7 +506,7 @@ function Get-TargetFolderItemsByRenderListData {
     Write-Verbose "Get-TargetFolderItemsByRenderListData: listServerRelativePath=$ListServerRelativePath, folderServerRelativePath=$FolderServerRelativePath"
 
     $baseApiUrl = $TargetSiteUrl.TrimEnd('/')
-    $encodedListPath = [System.Uri]::EscapeDataString($ListServerRelativePath)
+    $encodedListPath = [System.Uri]::EscapeUriString($ListServerRelativePath)
     $endpoint = "$baseApiUrl/_api/web/GetList(@listUrl)/RenderListDataAsStream?@listUrl='$encodedListPath'"
     $rows = @()
     $paging = $null
@@ -526,8 +526,7 @@ function Get-TargetFolderItemsByRenderListData {
         $body = $bodyObject | ConvertTo-Json -Depth 10
 
         Write-Verbose "Get-TargetFolderItemsByRenderListData: requesting page with paging token present=$(-not [string]::IsNullOrWhiteSpace($paging))"
-        $response = Invoke-PnPSPRestMethod -Method Post -Url $endpoint -Content $body -ContentType 'application/json;odata=verbose' -ErrorAction Stop
-        $json = ConvertFrom-PnPRestResponse -Response $response
+        $json = Invoke-SPORestPost -Url $endpoint -Body $body
 
         $pageRows = @()
         if ($json.PSObject.Properties.Name -contains 'Row') {
@@ -555,6 +554,41 @@ function Get-TargetFolderItemsByRenderListData {
     return @($result)
 }
 
+function Invoke-SPORestGet {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Url
+    )
+
+    $token = Get-PnPAccessToken -ErrorAction Stop
+    $headers = @{
+        Authorization = "Bearer $token"
+        Accept        = 'application/json;odata=nometadata'
+    }
+    return Invoke-RestMethod -Uri $Url -Method Get -Headers $headers -ErrorAction Stop
+}
+
+function Invoke-SPORestPost {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Url,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Body
+    )
+
+    $token = Get-PnPAccessToken -ErrorAction Stop
+    $headers = @{
+        Authorization  = "Bearer $token"
+        Accept         = 'application/json;odata=nometadata'
+        'Content-Type' = 'application/json'
+    }
+    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+    return Invoke-RestMethod -Uri $Url -Method Post -Headers $headers -Body $bodyBytes -ErrorAction Stop
+}
+
 function Get-PnPRestCollectionItems {
     [CmdletBinding()]
     param(
@@ -568,8 +602,7 @@ function Get-PnPRestCollectionItems {
     while (-not [string]::IsNullOrWhiteSpace($nextUrl)) {
         Write-Verbose "Get-PnPRestCollectionItems: requesting $nextUrl"
 
-        $response = Invoke-PnPSPRestMethod -Method Get -Url $nextUrl -ErrorAction Stop
-        $json = ConvertFrom-PnPRestResponse -Response $response
+        $json = Invoke-SPORestGet -Url $nextUrl
         $pageItems = @()
         $nextLink = $null
 
@@ -618,12 +651,12 @@ function Get-TargetFolderItemsByRest {
 
     Write-Verbose "Get-TargetFolderItemsByRest: folderServerRelativePath=$FolderServerRelativePath"
 
-    $encodedFolderPath = [System.Uri]::EscapeDataString($FolderServerRelativePath)
-    $escapedFolderPath = $encodedFolderPath.Replace("'", "''")
+    $escapedFolderPath = $FolderServerRelativePath.Replace("'", "''")
+    $encodedFolderPath = [System.Uri]::EscapeUriString($escapedFolderPath)
     $baseApiUrl = $TargetSiteUrl.TrimEnd('/')
 
-    $filesUrl = "$baseApiUrl/_api/web/GetFolderByServerRelativePath(decodedurl='$escapedFolderPath')/Files?`$select=Name,TimeLastModified,ServerRelativeUrl&`$top=5000"
-    $foldersUrl = "$baseApiUrl/_api/web/GetFolderByServerRelativePath(decodedurl='$escapedFolderPath')/Folders?`$select=Name,TimeLastModified,ServerRelativeUrl&`$top=5000"
+    $filesUrl = "$baseApiUrl/_api/web/GetFolderByServerRelativePath(decodedurl='$encodedFolderPath')/Files?`$select=Name,TimeLastModified,ServerRelativeUrl&`$top=5000"
+    $foldersUrl = "$baseApiUrl/_api/web/GetFolderByServerRelativePath(decodedurl='$encodedFolderPath')/Folders?`$select=Name,TimeLastModified,ServerRelativeUrl&`$top=5000"
 
     Write-Verbose "Get-TargetFolderItemsByRest: filesUrl=$filesUrl"
     Write-Verbose "Get-TargetFolderItemsByRest: foldersUrl=$foldersUrl"
